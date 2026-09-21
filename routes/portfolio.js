@@ -128,7 +128,7 @@ router.get("/", async (req, res) => {
     const filter = { userId: req.user._id };
     if (type && type !== "all") {
       if (type === "ppf_epf") {
-        filter.type = { `$in: ["ppf", "epf"] };
+        filter.type = { $in: ["ppf", "epf"] };
       } else {
         filter.type = type;
       }

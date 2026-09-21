@@ -1,0 +1,221 @@
+const express = require("express");
+const { body, validationResult } = require("express-validator");
+const Investment = require("../models/Investment");
+const { protect } = require("../middleware/auth");
+
+const router = express.Router();
+
+// All routes require authentication
+router.use(protect);
+
+// -- Helper: compute investedAmount from payload ---------------------------
+function calcInvestedAmount(data) {
+  switch (data.type) {
+    case "stock":
+    case "mutual_fund":
+    case "gold":
+    case "crypto":
+      return (Number(data.units) || 0) * (Number(data.buyPrice) || 0);
+    case "sip":
+      return (Number(data.sipAmount) || 0) * (Number(data.instalments) || 0);
+    case "ppf":
+    case "epf":
+    case "fd":
+    case "nps":
+    case "bond":
+      return Number(data.principal) || 0;
+    default:
+      return Number(data.investedAmount) || 0;
+  }
+}
+
+// -- Helper: compute current value for one investment ---------------------
+function calcCurrentValue(inv) {
+  const fixedTypes = ["fd", "ppf", "epf", "nps"];
+
+  if (fixedTypes.includes(inv.type)) {
+    return inv.estimatedValue();
+  }
+
+  // Market assets with live price
+  if (inv.currentPrice > 0) {
+    if (["stock", "mutual_fund", "gold", "crypto", "bond"].includes(inv.type)) {
+      return (inv.units || 0) * inv.currentPrice;
+    }
+    if (inv.type === "sip" && inv.avgNav > 0) {
+      // Estimate total units accumulated via SIP
+      const totalUnits = ((inv.sipAmount || 0) * (inv.instalments || 0)) / inv.avgNav;
+      return totalUnits * inv.currentPrice;
+    }
+  }
+
+  // Fallback to invested amount
+  return inv.investedAmount || 0;
+}
+
+// -- GET /api/portfolio/summary --------------------------------------------
+router.get("/summary", async (req, res) => {
+  try {
+    const investments = await Investment.find({ userId: req.user._id });
+
+    if (investments.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          totalInvested: 0, currentValue: 0, totalGain: 0,
+          totalGainPercent: 0, holdings: 0, byType: {},
+          recentInvestments: [], pricesLastUpdated: null,
+        },
+      });
+    }
+
+    const totalInvested = investments.reduce((s, i) => s + (i.investedAmount || 0), 0);
+    const currentValue = investments.reduce((s, i) => s + calcCurrentValue(i), 0);
+    const totalGain = currentValue - totalInvested;
+    const totalGainPercent = totalInvested > 0 ? (totalGain / totalInvested) * 100 : 0;
+
+    // Allocation by type
+    const byType = {};
+    investments.forEach((inv) => {
+      if (!byType[inv.type]) byType[inv.type] = { count: 0, invested: 0, currentValue: 0 };
+      byType[inv.type].count += 1;
+      byType[inv.type].invested += inv.investedAmount || 0;
+      byType[inv.type].currentValue += calcCurrentValue(inv);
+    });
+
+    // Latest price update timestamp
+    const pricesLastUpdated = investments
+      .filter((i) => i.lastPriceUpdate)
+      .sort((a, b) => new Date(b.lastPriceUpdate) - new Date(a.lastPriceUpdate))[0]
+      ?.lastPriceUpdate ?? null;
+
+    // Recent investments (last 6)
+    const recentInvestments = [...investments]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 6)
+      .map((inv) => {
+        const cv = calcCurrentValue(inv);
+        return {
+          _id: inv._id, name: inv.name, type: inv.type,
+          investedAmount: inv.investedAmount,
+          currentValue: cv,
+          gain: cv - inv.investedAmount,
+          gainPercent: inv.investedAmount > 0 ? ((cv - inv.investedAmount) / inv.investedAmount) * 100 : 0,
+          symbol: inv.symbol,
+          buyDate: inv.buyDate || inv.sipStartDate,
+          createdAt: inv.createdAt,
+        };
+      });
+
+    res.json({
+      success: true,
+      data: {
+        totalInvested, currentValue, totalGain,
+        totalGainPercent, holdings: investments.length,
+        byType, recentInvestments, pricesLastUpdated,
+      },
+    });
+  } catch (err) {
+    console.error("Summary error:", err);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// -- GET /api/portfolio ----------------------------------------------------
+router.get("/", async (req, res) => {
+  try {
+    const { type, sort = "createdAt", order = "desc", search } = req.query;
+    const filter = { userId: req.user._id };
+    if (type && type !== "all") {
+      if (type === "ppf_epf") {
+        filter.type = { `$in: ["ppf", "epf"] };
+      } else {
+        filter.type = type;
+      }
+    }
+    if (search) filter.name = { $regex: search, $options: "i" };
+
+    const sortDir = order === "asc" ? 1 : -1;
+    const investments = await Investment.find(filter).sort({ [sort]: sortDir });
+
+    // Attach computed fields to each investment
+    const result = investments.map((inv) => {
+      const obj = inv.toObject();
+      const cv = calcCurrentValue(inv);
+      obj.currentValue = cv;
+      obj.gain = cv - (inv.investedAmount || 0);
+      obj.gainPercent = (inv.investedAmount || 0) > 0
+        ? (obj.gain / inv.investedAmount) * 100 : 0;
+      return obj;
+    });
+
+    res.json({ success: true, data: result, count: result.length });
+  } catch (err) {
+    console.error("Get portfolio error:", err);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// -- POST /api/portfolio ---------------------------------------------------
+router.post(
+  "/",
+  [body("type").notEmpty(), body("name").trim().notEmpty()],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ success: false, errors: errors.array() });
+
+    try {
+      const payload = { ...req.body, userId: req.user._id };
+      payload.investedAmount = calcInvestedAmount(payload);
+      const investment = await Investment.create(payload);
+      res.status(201).json({ success: true, data: investment });
+    } catch (err) {
+      console.error("Add investment error:", err);
+      res.status(500).json({ success: false, message: "Server error." });
+    }
+  }
+);
+
+// -- PUT /api/portfolio/:id ------------------------------------------------
+router.put("/:id", async (req, res) => {
+  try {
+    const investment = await Investment.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!investment)
+      return res.status(404).json({ success: false, message: "Investment not found." });
+
+    const payload = { ...req.body };
+    payload.investedAmount = calcInvestedAmount({ ...investment.toObject(), ...payload });
+    Object.assign(investment, payload);
+    await investment.save();
+
+    const obj = investment.toObject();
+    const cv = calcCurrentValue(investment);
+    obj.currentValue = cv;
+    obj.gain = cv - investment.investedAmount;
+    obj.gainPercent = investment.investedAmount > 0 ? (obj.gain / investment.investedAmount) * 100 : 0;
+
+    res.json({ success: true, data: obj });
+  } catch (err) {
+    console.error("Update investment error:", err);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// -- DELETE /api/portfolio/:id ---------------------------------------------
+router.delete("/:id", async (req, res) => {
+  try {
+    const investment = await Investment.findOneAndDelete({
+      _id: req.params.id, userId: req.user._id,
+    });
+    if (!investment)
+      return res.status(404).json({ success: false, message: "Investment not found." });
+    res.json({ success: true, message: "Investment deleted." });
+  } catch (err) {
+    console.error("Delete investment error:", err);
+    res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+module.exports = router;
+

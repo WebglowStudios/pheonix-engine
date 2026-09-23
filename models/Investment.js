@@ -13,7 +13,17 @@ const InvestmentSchema = new mongoose.Schema(
     type: {
       type: String,
       required: [true, "Investment type is required"],
-      enum: ["stock", "mutual_fund", "sip", "ppf", "epf", "fd", "nps", "bond", "gold", "crypto"],
+      enum: ["stock", "mutual_fund", "sip", "ppf", "epf", "fd", "nps", "bond", "gold", "crypto", "reit_invit", "aif"],
+    },
+    transactionType: {
+      type: String,
+      enum: ["buy", "sell", "sip", "swp", "stp", "switch"],
+      default: "buy",
+    },
+    folioNumber: {
+      type: String,
+      default: "",
+      trim: true,
     },
     name: {
       type: String,
@@ -21,7 +31,7 @@ const InvestmentSchema = new mongoose.Schema(
       trim: true,
     },
 
-    // -- Market assets (stock, mutual_fund, gold, crypto) -----------------
+    // -- Market assets (stock, mutual_fund, gold, crypto, reit_invit) -----
     symbol: { type: String, default: "", trim: true },   // e.g. RELIANCE, GC=F
     exchange: { type: String, default: "", trim: true }, // NSE / BSE
     units: { type: Number, default: 0 },

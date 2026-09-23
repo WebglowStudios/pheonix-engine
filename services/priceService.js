@@ -7,17 +7,35 @@
  */
 
 const axios = require("axios");
-const yahooFinance = require("yahoo-finance2").default;
+const YahooFinanceClass = require("yahoo-finance2").default;
+const yf = typeof YahooFinanceClass === "function" ? new YahooFinanceClass() : YahooFinanceClass;
 const Investment = require("../models/Investment");
 
 // Helper
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Simple in-memory cache for search queries (10 minute TTL)
+const searchCache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+function getCached(key) {
+  const item = searchCache.get(key);
+  if (!item) return null;
+  if (Date.now() - item.time > CACHE_TTL_MS) {
+    searchCache.delete(key);
+    return null;
+  }
+  return item.data;
+}
+
+function setCached(key, data) {
+  if (searchCache.size > 500) searchCache.clear();
+  searchCache.set(key, { time: Date.now(), data });
+}
+
 // -- Yahoo Finance (via yahoo-finance2) -------------------------------------
 async function fetchYahooPrice(symbol) {
   try {
-    // Use the scraper-free quote API through yahoo-finance2
-    const yf = require("yahoo-finance2").default;
     const quote = await yf.quote(symbol, {}, { validateResult: false });
     const price = quote?.regularMarketPrice ?? quote?.price?.regularMarketPrice;
     return typeof price === "number" ? price : null;
@@ -167,11 +185,120 @@ async function lookupMFNav(amfiCode) {
   return await fetchMFNav(amfiCode);
 }
 
+// -- Search Stocks / Equities via Yahoo Finance ----------------------------
+async function searchStocks(query) {
+  if (!query || query.trim().length < 2) return [];
+  const q = query.trim();
+  const cacheKey = `stock:${q.toLowerCase()}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const res = await yf.search(q, { newsCount: 0 });
+    const quotes = (res.quotes || []).filter(
+      (item) => item.quoteType === "EQUITY" || item.quoteType === "ETF"
+    );
+
+    // Prefer Indian symbols (.NS or .BO) or keep others if not available
+    const indianQuotes = quotes.filter(
+      (item) => item.symbol && (item.symbol.endsWith(".NS") || item.symbol.endsWith(".BO"))
+    );
+    const candidateList = indianQuotes.length > 0 ? indianQuotes : quotes;
+
+    const results = candidateList.slice(0, 8).map((item) => {
+      let exchange = "NSE";
+      let cleanSymbol = item.symbol || "";
+      if (cleanSymbol.endsWith(".NS")) {
+        exchange = "NSE";
+        cleanSymbol = cleanSymbol.replace(".NS", "");
+      } else if (cleanSymbol.endsWith(".BO")) {
+        exchange = "BSE";
+        cleanSymbol = cleanSymbol.replace(".BO", "");
+      } else if (item.exchange === "BSE") {
+        exchange = "BSE";
+      }
+
+      return {
+        name: item.longname || item.shortname || cleanSymbol,
+        symbol: cleanSymbol,
+        fullSymbol: item.symbol,
+        exchange,
+        type: "stock",
+      };
+    });
+
+    setCached(cacheKey, results);
+    return results;
+  } catch (err) {
+    console.warn(`[Yahoo Search] "${q}": ${err.message}`);
+    return [];
+  }
+}
+
+// -- Search Mutual Funds / SIP via mfapi.in ---------------------------------
+async function searchMutualFunds(query) {
+  if (!query || query.trim().length < 2) return [];
+  const q = query.trim();
+  const cacheKey = `mf:${q.toLowerCase()}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const res = await axios.get(`https://api.mfapi.in/mf/search?q=${encodeURIComponent(q)}`, {
+      timeout: 9000,
+    });
+    const items = Array.isArray(res.data) ? res.data : [];
+    const results = items.slice(0, 10).map((item) => ({
+      name: item.schemeName,
+      symbol: String(item.schemeCode),
+      code: String(item.schemeCode),
+      type: "mutual_fund",
+    }));
+
+    setCached(cacheKey, results);
+    return results;
+  } catch (err) {
+    console.warn(`[AMFI Search] "${q}": ${err.message}`);
+    return [];
+  }
+}
+
+// -- Search Crypto via CoinGecko --------------------------------------------
+async function searchCrypto(query) {
+  if (!query || query.trim().length < 2) return [];
+  const q = query.trim();
+  const cacheKey = `crypto:${q.toLowerCase()}`;
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const res = await axios.get(`https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(q)}`, {
+      timeout: 8000,
+    });
+    const coins = Array.isArray(res.data?.coins) ? res.data.coins : [];
+    const results = coins.slice(0, 8).map((c) => ({
+      name: c.name,
+      symbol: (c.symbol || "").toUpperCase(),
+      id: c.id,
+      type: "crypto",
+    }));
+
+    setCached(cacheKey, results);
+    return results;
+  } catch (err) {
+    console.warn(`[CoinGecko Search] "${q}": ${err.message}`);
+    return [];
+  }
+}
+
 module.exports = {
   updatePricesForUser,
   lookupStockPrice,
   lookupMFNav,
   fetchCryptoPrice,
   fetchGoldPriceINR,
+  searchStocks,
+  searchMutualFunds,
+  searchCrypto,
 };
 

@@ -6,6 +6,9 @@ const {
   lookupMFNav,
   fetchCryptoPrice,
   fetchGoldPriceINR,
+  searchStocks,
+  searchMutualFunds,
+  searchCrypto,
 } = require("../services/priceService");
 
 const router = express.Router();
@@ -32,6 +35,31 @@ router.post("/refresh", async (req, res) => {
   } catch (err) {
     console.error("Price refresh error:", err);
     res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// -- GET /api/prices/search?type=<stock|mutual_fund|crypto>&q=<query> ------
+// Autocomplete suggestion search by name or symbol
+router.get("/search", async (req, res) => {
+  const { type = "stock", q } = req.query;
+  if (!q || q.trim().length < 2) {
+    return res.json({ success: true, count: 0, data: [] });
+  }
+
+  try {
+    let results = [];
+    if (type === "stock") {
+      results = await searchStocks(q);
+    } else if (type === "mutual_fund" || type === "sip") {
+      results = await searchMutualFunds(q);
+    } else if (type === "crypto") {
+      results = await searchCrypto(q);
+    }
+
+    res.json({ success: true, count: results.length, data: results });
+  } catch (err) {
+    console.error("Search error:", err);
+    res.status(500).json({ success: false, message: err.message, data: [] });
   }
 });
 

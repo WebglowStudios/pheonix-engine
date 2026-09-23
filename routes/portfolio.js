@@ -12,6 +12,7 @@ router.use(protect);
 function calcInvestedAmount(data) {
   switch (data.type) {
     case "stock":
+    case "reit_invit":
     case "mutual_fund":
     case "gold":
     case "crypto":
@@ -24,6 +25,8 @@ function calcInvestedAmount(data) {
     case "nps":
     case "bond":
       return Number(data.principal) || 0;
+    case "aif":
+      return Number(data.investedAmount || data.principal || 0);
     default:
       return Number(data.investedAmount) || 0;
   }
@@ -37,9 +40,14 @@ function calcCurrentValue(inv) {
     return inv.estimatedValue();
   }
 
+  if (inv.type === "aif") {
+    // If current valuation is entered, use it; otherwise fallback to investedAmount
+    return inv.currentPrice > 0 ? inv.currentPrice : (inv.investedAmount || 0);
+  }
+
   // Market assets with live price
   if (inv.currentPrice > 0) {
-    if (["stock", "mutual_fund", "gold", "crypto", "bond"].includes(inv.type)) {
+    if (["stock", "reit_invit", "mutual_fund", "gold", "crypto", "bond"].includes(inv.type)) {
       return (inv.units || 0) * inv.currentPrice;
     }
     if (inv.type === "sip" && inv.avgNav > 0) {

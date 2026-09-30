@@ -243,6 +243,33 @@ router.get("/users", async (req, res) => {
   }
 });
 
+function calcCurrentValue(inv) {
+  const fixedTypes = ["fd", "ppf", "epf", "nps", "bond"];
+
+  if (fixedTypes.includes(inv.type)) {
+    return typeof inv.estimatedValue === "function"
+      ? inv.estimatedValue()
+      : (inv.principal || inv.investedAmount || 0);
+  }
+
+  if (inv.type === "aif") {
+    return inv.currentPrice > 0 ? inv.currentPrice : (inv.investedAmount || 0);
+  }
+
+  // Market assets with live price
+  if (inv.currentPrice > 0) {
+    if (["stock", "reit_invit", "mutual_fund", "gold", "crypto", "bond"].includes(inv.type)) {
+      return (inv.units || 0) * inv.currentPrice;
+    }
+    if (inv.type === "sip" && inv.avgNav > 0) {
+      const totalUnits = ((inv.sipAmount || 0) * (inv.instalments || 0)) / inv.avgNav;
+      return totalUnits * inv.currentPrice;
+    }
+  }
+
+  return inv.investedAmount || 0;
+}
+
 router.get("/users/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id)
@@ -254,15 +281,60 @@ router.get("/users/:id", async (req, res) => {
     }
 
     const investments = await Investment.find({ userId: user._id })
-      .sort({ createdAt: -1 })
-      .lean();
+      .sort({ createdAt: -1 });
+
+    let totalInvested = 0;
+    let totalCurrent = 0;
+    const byType = {};
+
+    const enrichedInvestments = investments.map((inv) => {
+      const cv = calcCurrentValue(inv);
+      const invested = inv.investedAmount || 0;
+      const gain = cv - invested;
+      const gainPercent = invested > 0 ? (gain / invested) * 100 : 0;
+
+      totalInvested += invested;
+      totalCurrent += cv;
+
+      if (!byType[inv.type]) {
+        byType[inv.type] = { count: 0, invested: 0, currentValue: 0 };
+      }
+      byType[inv.type].count += 1;
+      byType[inv.type].invested += invested;
+      byType[inv.type].currentValue += cv;
+
+      const obj = inv.toObject();
+      return {
+        ...obj,
+        currentValue: Math.round(cv * 100) / 100,
+        gain: Math.round(gain * 100) / 100,
+        gainPercent: Math.round(gainPercent * 100) / 100,
+      };
+    });
+
+    const totalGain = totalCurrent - totalInvested;
+    const totalGainPercent = totalInvested > 0 ? (totalGain / totalInvested) * 100 : 0;
+
+    const summary = {
+      totalInvested: Math.round(totalInvested * 100) / 100,
+      currentValue: Math.round(totalCurrent * 100) / 100,
+      totalGain: Math.round(totalGain * 100) / 100,
+      totalGainPercent: Math.round(totalGainPercent * 100) / 100,
+      holdings: investments.length,
+      byType,
+      pricesLastUpdated: investments
+        .filter((i) => i.lastPriceUpdate)
+        .sort((a, b) => new Date(b.lastPriceUpdate) - new Date(a.lastPriceUpdate))[0]
+        ?.lastPriceUpdate ?? null,
+    };
 
     const userObj = { ...user, id: user._id };
     res.json({
       success: true,
       user: userObj,
-      investments,
-      data: { user: userObj, investments },
+      investments: enrichedInvestments,
+      summary,
+      data: { user: userObj, investments: enrichedInvestments, summary },
     });
   } catch (error) {
     console.error("Admin get user error:", error);

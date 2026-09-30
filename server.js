@@ -15,10 +15,7 @@ startPriceUpdateCron();
 // --- Middleware ------------------------------------------------------------
 app.use(
   cors({
-    origin: [
-      process.env.CLIENT_URL || "http://localhost:3000",
-      "https://phoenixfiserv.co.in",
-    ],
+    origin: true,
     credentials: true,
   })
 );

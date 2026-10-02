@@ -387,8 +387,10 @@ router.get("/family/cumulative", async (req, res) => {
 
     // Build user mapping
     const memberMap = new Map();
-    memberMap.set(currentUser._id.toString(), {
-      id: currentUser._id.toString(),
+    const selfIdStr = currentUser._id.toString();
+    memberMap.set(selfIdStr, {
+      id: selfIdStr,
+      userId: selfIdStr,         // alias so frontend unlink works
       name: currentUser.name,
       email: currentUser.email,
       phone: currentUser.phone,
@@ -403,9 +405,11 @@ router.get("/family/cumulative", async (req, res) => {
     if (currentUser.familyMembers && currentUser.familyMembers.length > 0) {
       currentUser.familyMembers.forEach((m) => {
         if (m.userId) {
+          const midStr = m.userId._id.toString();
           userIds.push(m.userId._id);
-          memberMap.set(m.userId._id.toString(), {
-            id: m.userId._id.toString(),
+          memberMap.set(midStr, {
+            id: midStr,
+            userId: midStr,       // alias so frontend unlink works
             name: m.userId.name,
             email: m.userId.email,
             phone: m.userId.phone,
@@ -506,7 +510,20 @@ router.get("/family/cumulative", async (req, res) => {
         ?.lastPriceUpdate ?? null,
     };
 
-    const membersList = Array.from(memberMap.values());
+    // Attach computed stats to every member entry so individual cards show real numbers
+    const membersList = Array.from(memberMap.values()).map((m) => {
+      const ms = byMember[m.id] || { invested: 0, currentValue: 0, gain: 0, holdings: 0 };
+      return {
+        ...m,
+        stats: {
+          totalInvested: ms.invested,
+          currentValue: ms.currentValue,
+          totalGain: ms.gain,
+          totalGainPercent: ms.invested > 0 ? (ms.gain / ms.invested) * 100 : 0,
+          holdingsCount: ms.holdings,
+        },
+      };
+    });
 
     res.json({
       success: true,

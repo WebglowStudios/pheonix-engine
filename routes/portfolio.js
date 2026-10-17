@@ -113,6 +113,7 @@ router.get("/summary", async (req, res) => {
           symbol: inv.symbol,
           buyDate: inv.buyDate || inv.sipStartDate,
           createdAt: inv.createdAt,
+          notes: inv.notes || "",
         };
       });
 

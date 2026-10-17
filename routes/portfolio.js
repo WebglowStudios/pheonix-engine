@@ -143,7 +143,13 @@ router.get("/", async (req, res) => {
         filter.type = type;
       }
     }
-    if (search) filter.name = { $regex: search, $options: "i" };
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: "i" } },
+        { symbol: { $regex: search, $options: "i" } },
+        { category: { $regex: search, $options: "i" } },
+      ];
+    }
 
     const sortDir = order === "asc" ? 1 : -1;
     const investments = await Investment.find(filter).sort({ [sort]: sortDir });

@@ -833,4 +833,41 @@ router.delete("/faqs/:id", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. INVESTMENT CATEGORIZATION (Admin only EDEOH categorization)
+// ─────────────────────────────────────────────────────────────────────────────
+router.patch("/investments/:id/category", async (req, res) => {
+  try {
+    const { category } = req.body;
+    const allowed = ["equity", "debt", "elss", "others", "hybrid", ""];
+    const normalized = (category || "").toLowerCase().trim();
+
+    if (!allowed.includes(normalized)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid category. Must be one of: ${allowed.filter(Boolean).join(", ")} or empty string.`,
+      });
+    }
+
+    const investment = await Investment.findByIdAndUpdate(
+      req.params.id,
+      { $set: { category: normalized } },
+      { new: true }
+    );
+
+    if (!investment) {
+      return res.status(404).json({ success: false, message: "Investment not found." });
+    }
+
+    res.json({
+      success: true,
+      data: investment,
+      message: "Investment category updated successfully.",
+    });
+  } catch (error) {
+    console.error("Admin update investment category error:", error);
+    res.status(500).json({ success: false, message: "Failed to update investment category." });
+  }
+});
+
 module.exports = router;

@@ -58,7 +58,25 @@ const InvestmentSchema = new mongoose.Schema(
     currentPrice: { type: Number, default: 0 },
     lastPriceUpdate: { type: Date },
 
-    // -- Meta --------------------------------------------------------------
+    // -- Compounding & Capital Recovery (Free Shares) ---------------------
+    status: {
+      type: String,
+      enum: ["active", "closed"],
+      default: "active",
+    },
+    originalInvestedAmount: { type: Number, default: 0 },
+    realizedGain: { type: Number, default: 0 },
+    totalProceeds: { type: Number, default: 0 },
+    isFreeShare: { type: Boolean, default: false },
+
+    // -- Meta & Categorization --------------------------------------------
+    category: {
+      type: String,
+      enum: ["equity", "debt", "elss", "others", "hybrid", ""],
+      default: "",
+      lowercase: true,
+      trim: true,
+    },
     notes: { type: String, default: "", trim: true },
     tags: [{ type: String, trim: true }],
   },

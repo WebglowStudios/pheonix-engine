@@ -1,6 +1,7 @@
 const express = require("express");
 const { body, validationResult } = require("express-validator");
 const Investment = require("../models/Investment");
+const Transaction = require("../models/Transaction");
 const User = require("../models/User");
 const { protect } = require("../middleware/auth");
 
@@ -582,6 +583,179 @@ router.delete("/:id", async (req, res) => {
   } catch (err) {
     console.error("Delete investment error:", err);
     res.status(500).json({ success: false, message: "Server error." });
+  }
+});
+
+// -- POST /api/portfolio/:id/sell (Compounding & Capital Recovery Sale) ------
+router.post(
+  "/:id/sell",
+  [
+    body("units").isFloat({ gt: 0 }).withMessage("Units to sell must be greater than 0"),
+    body("sellPrice").isFloat({ gt: 0 }).withMessage("Sell price must be greater than 0"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const investment = await Investment.findOne({ _id: req.params.id, userId: req.user._id });
+      if (!investment) {
+        return res.status(404).json({ success: false, message: "Investment not found." });
+      }
+
+      const unitsToSell = Number(req.body.units);
+      const sellPrice = Number(req.body.sellPrice);
+      const sellDate = req.body.sellDate ? new Date(req.body.sellDate) : new Date();
+      const notes = (req.body.notes || "").trim();
+
+      const availableUnits = investment.units || 0;
+      if (unitsToSell > availableUnits) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot sell ${unitsToSell} units. You only hold ${availableUnits} units.`,
+        });
+      }
+
+      // Initialize originalInvestedAmount if not set
+      if (!investment.originalInvestedAmount || investment.originalInvestedAmount === 0) {
+        investment.originalInvestedAmount = investment.investedAmount || 0;
+      }
+
+      const buyPrice =
+        investment.buyPrice ||
+        (investment.investedAmount > 0 && availableUnits > 0
+          ? investment.investedAmount / availableUnits
+          : 0);
+
+      const totalProceeds = Math.round(unitsToSell * sellPrice * 100) / 100;
+      const costOfSoldUnits = Math.round(unitsToSell * buyPrice * 100) / 100;
+      const realizedGain = Math.round((totalProceeds - costOfSoldUnits) * 100) / 100;
+      const realizedGainPercent =
+        costOfSoldUnits > 0 ? Math.round((realizedGain / costOfSoldUnits) * 10000) / 100 : 0;
+
+      const cumulativeProceeds = (investment.totalProceeds || 0) + totalProceeds;
+      const originalCapital = investment.originalInvestedAmount || investment.investedAmount;
+      const isFreeShares = cumulativeProceeds >= originalCapital && originalCapital > 0;
+
+      const remainingUnits = Math.round((availableUnits - unitsToSell) * 1000) / 1000;
+      const remainingInvested = Math.round(remainingUnits * buyPrice * 100) / 100;
+      const remainingValue = Math.round(remainingUnits * sellPrice * 100) / 100;
+
+      // Create transaction record
+      const transaction = await Transaction.create({
+        userId: req.user._id,
+        investmentId: investment._id,
+        investmentName: investment.name,
+        type: "sell",
+        units: unitsToSell,
+        price: sellPrice,
+        buyPrice,
+        totalProceeds,
+        realizedGain,
+        realizedGainPercent,
+        capitalRecovered: Math.min(cumulativeProceeds, originalCapital),
+        isFreeShares,
+        remainingUnits,
+        remainingValue,
+        sellDate,
+        notes,
+      });
+
+      // Update investment
+      investment.totalProceeds = cumulativeProceeds;
+      investment.realizedGain = (investment.realizedGain || 0) + realizedGain;
+      investment.units = remainingUnits;
+      investment.investedAmount = remainingInvested;
+      investment.isFreeShare = isFreeShares && remainingUnits > 0;
+
+      if (remainingUnits === 0) {
+        investment.status = "closed";
+      }
+
+      await investment.save();
+
+      const obj = investment.toObject();
+      const cv = calcCurrentValue(investment);
+      obj.currentValue = cv;
+      obj.gain = cv - investment.investedAmount;
+      obj.gainPercent =
+        investment.investedAmount > 0 ? (obj.gain / investment.investedAmount) * 100 : 0;
+
+      res.json({
+        success: true,
+        message:
+          isFreeShares && remainingUnits > 0
+            ? `Sold ${unitsToSell} units. Remaining ${remainingUnits} units are now 100% FREE SHARES!`
+            : `Successfully sold ${unitsToSell} units. Realized profit: ₹${realizedGain.toLocaleString("en-IN")}.`,
+        data: {
+          investment: obj,
+          transaction,
+          summary: {
+            unitsSold: unitsToSell,
+            sellPrice,
+            totalProceeds,
+            realizedGain,
+            realizedGainPercent,
+            remainingUnits,
+            isFreeShares,
+            capitalRecoveredPercent:
+              originalCapital > 0
+                ? Math.round((cumulativeProceeds / originalCapital) * 100)
+                : 100,
+          },
+        },
+      });
+    } catch (err) {
+      console.error("Sell investment error:", err);
+      res.status(500).json({ success: false, message: "Server error during sell operation." });
+    }
+  }
+);
+
+// -- GET /api/portfolio/transactions ---------------------------------------
+router.get("/transactions", async (req, res) => {
+  try {
+    const { investmentId, limit = 100 } = req.query;
+    const filter = { userId: req.user._id };
+    if (investmentId) filter.investmentId = investmentId;
+
+    const transactions = await Transaction.find(filter)
+      .sort({ sellDate: -1, createdAt: -1 })
+      .limit(Number(limit));
+
+    const totalRealizedProfit = transactions.reduce((acc, t) => acc + (t.realizedGain || 0), 0);
+    const totalProceeds = transactions.reduce((acc, t) => acc + (t.totalProceeds || 0), 0);
+    const totalCostBasis = transactions.reduce((acc, t) => acc + (t.units * (t.buyPrice || 0)), 0);
+    const profitableCount = transactions.filter((t) => (t.realizedGain || 0) > 0).length;
+    const lossCount = transactions.filter((t) => (t.realizedGain || 0) < 0).length;
+    const freeSharesCount = transactions.filter((t) => t.isFreeShares).length;
+
+    const summary = {
+      totalTrades: transactions.length,
+      totalRealizedProfit: Math.round(totalRealizedProfit * 100) / 100,
+      totalProceeds: Math.round(totalProceeds * 100) / 100,
+      totalCostBasis: Math.round(totalCostBasis * 100) / 100,
+      overallReturnPercent:
+        totalCostBasis > 0 ? Math.round((totalRealizedProfit / totalCostBasis) * 10000) / 100 : 0,
+      profitableCount,
+      lossCount,
+      winRate:
+        transactions.length > 0 ? Math.round((profitableCount / transactions.length) * 100) : 0,
+      freeSharesCount,
+    };
+
+    res.json({
+      success: true,
+      data: transactions,
+      transactions,
+      summary,
+      count: transactions.length,
+    });
+  } catch (err) {
+    console.error("Get transactions error:", err);
+    res.status(500).json({ success: false, message: "Server error fetching transactions." });
   }
 });
 

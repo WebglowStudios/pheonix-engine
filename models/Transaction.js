@@ -19,6 +19,12 @@ const TransactionSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    // ── Position identity ──────────────────────────────────────────────────
+    // symbol + exchange identify which position this sell belongs to.
+    // Allows grouping multiple lots into a single open position.
+    symbol: { type: String, default: "", trim: true },
+    exchange: { type: String, default: "", trim: true },
+
     type: {
       type: String,
       enum: ["sell", "buy", "sip", "dividend"],
@@ -32,10 +38,17 @@ const TransactionSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
+    // buyPrice on the specific lot that was sold
     buyPrice: {
       type: Number,
       default: 0,
     },
+    // ── Position-level cost basis ──────────────────────────────────────────
+    // Weighted average cost across ALL open lots for this symbol at sell time.
+    // This is what the client's logic requires:
+    //   realizedGain = unitsSold × (sellPrice − avgCostBefore)
+    avgCostBefore: { type: Number, default: 0 },
+
     totalProceeds: {
       type: Number,
       required: true,
@@ -56,6 +69,13 @@ const TransactionSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // ── Open position AFTER this sell ─────────────────────────────────────
+    // Total remaining qty across ALL active lots for this symbol after the sell.
+    openQtyAfter: { type: Number, default: 0 },
+    // Average cost of the remaining open position (unchanged by a sell).
+    avgCostAfter: { type: Number, default: 0 },
+
+    // Legacy single-lot remaining fields (kept for backward compat)
     remainingUnits: {
       type: Number,
       default: 0,

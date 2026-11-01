@@ -10,6 +10,7 @@ const axios = require("axios");
 const YahooFinanceClass = require("yahoo-finance2").default;
 const yf = typeof YahooFinanceClass === "function" ? new YahooFinanceClass() : YahooFinanceClass;
 const Investment = require("../models/Investment");
+const ProductPrice = require("../models/ProductPrice");
 
 // Helper
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -154,6 +155,19 @@ async function updatePricesForUser(userId) {
         }
       } else if (inv.type === "crypto") {
         price = await fetchCryptoPrice(inv.symbol);
+      }
+
+      if (price === null || price <= 0) {
+        // Fallback: Check if admin has set a master custom price override
+        const override = await ProductPrice.findOne({
+          $or: [
+            ...(inv.symbol ? [{ symbol: inv.symbol.toUpperCase() }] : []),
+            { name: inv.name },
+          ],
+        });
+        if (override && override.price > 0) {
+          price = override.price;
+        }
       }
 
       if (price !== null && price > 0) {

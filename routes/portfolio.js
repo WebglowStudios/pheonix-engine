@@ -586,7 +586,15 @@ router.delete("/:id", async (req, res) => {
   }
 });
 
-// -- POST /api/portfolio/:id/sell (Compounding & Capital Recovery Sale) ------
+// -- POST /api/portfolio/:id/sell (Position-aware Average Cost Sell) ----------
+//
+// Logic (per client directive):
+//  1. Find ALL active Investment lots for this user with the same symbol+exchange.
+//  2. Compute the weighted avg cost across ALL those open lots.
+//  3. Realized gain = unitsSold × (sellPrice − avgCost)   ← the correct formula
+//  4. Reduce units on the target lot document (FIFO: oldest lot first if partial).
+//  5. Store openQtyAfter = total remaining qty across all lots after the sell.
+//
 router.post(
   "/:id/sell",
   [
@@ -606,69 +614,114 @@ router.post(
       }
 
       const unitsToSell = Number(req.body.units);
-      const sellPrice = Number(req.body.sellPrice);
-      const sellDate = req.body.sellDate ? new Date(req.body.sellDate) : new Date();
-      const notes = (req.body.notes || "").trim();
+      const sellPrice   = Number(req.body.sellPrice);
+      const sellDate    = req.body.sellDate ? new Date(req.body.sellDate) : new Date();
+      const notes       = (req.body.notes || "").trim();
 
       const availableUnits = investment.units || 0;
       if (unitsToSell > availableUnits) {
         return res.status(400).json({
           success: false,
-          message: `Cannot sell ${unitsToSell} units. You only hold ${availableUnits} units.`,
+          message: `Cannot sell ${unitsToSell} units. Only ${availableUnits} units available in this lot.`,
         });
       }
 
-      // Initialize originalInvestedAmount if not set
-      if (!investment.originalInvestedAmount || investment.originalInvestedAmount === 0) {
-        investment.originalInvestedAmount = investment.investedAmount || 0;
+      // ───────────────────────────────────────────────────────────
+      // STEP 1: Find ALL active lots for this symbol+exchange to compute
+      // the position-level weighted average cost.
+      // If the investment has no symbol (FD, PPF, etc.) fall back to single-lot buyPrice.
+      // ───────────────────────────────────────────────────────────
+      let avgCost = investment.buyPrice || (availableUnits > 0 ? investment.investedAmount / availableUnits : 0);
+      let totalOpenQtyBefore = availableUnits; // default: only this lot
+
+      if (investment.symbol) {
+        // Fetch all active lots for the same symbol+exchange
+        const positionFilter = {
+          userId:   req.user._id,
+          symbol:   investment.symbol,
+          status:   "active",
+          units:    { $gt: 0 },
+        };
+        if (investment.exchange) positionFilter.exchange = investment.exchange;
+
+        const allLots = await Investment.find(positionFilter);
+
+        if (allLots.length > 0) {
+          // Weighted avg: sum(units_i * buyPrice_i) / sum(units_i)
+          let totalUnits    = 0;
+          let totalCostBasis = 0;
+          allLots.forEach((lot) => {
+            const lotUnits = lot.units || 0;
+            const lotBuy   = lot.buyPrice || (lot.investedAmount > 0 && lotUnits > 0 ? lot.investedAmount / lotUnits : 0);
+            totalUnits    += lotUnits;
+            totalCostBasis += lotUnits * lotBuy;
+          });
+          avgCost             = totalUnits > 0 ? totalCostBasis / totalUnits : avgCost;
+          totalOpenQtyBefore  = totalUnits;
+        }
       }
 
-      const buyPrice =
-        investment.buyPrice ||
-        (investment.investedAmount > 0 && availableUnits > 0
-          ? investment.investedAmount / availableUnits
-          : 0);
-
-      const totalProceeds = Math.round(unitsToSell * sellPrice * 100) / 100;
-      const costOfSoldUnits = Math.round(unitsToSell * buyPrice * 100) / 100;
-      const realizedGain = Math.round((totalProceeds - costOfSoldUnits) * 100) / 100;
+      // ───────────────────────────────────────────────────────────
+      // STEP 2: Calculate realized P&L using position avg cost
+      // ───────────────────────────────────────────────────────────
+      const totalProceeds      = Math.round(unitsToSell * sellPrice * 100) / 100;
+      const costOfSoldUnits    = Math.round(unitsToSell * avgCost * 100) / 100;
+      const realizedGain       = Math.round((totalProceeds - costOfSoldUnits) * 100) / 100;
       const realizedGainPercent =
         costOfSoldUnits > 0 ? Math.round((realizedGain / costOfSoldUnits) * 10000) / 100 : 0;
 
+      // Open qty after this sell (across ALL lots)
+      const openQtyAfter   = Math.round((totalOpenQtyBefore - unitsToSell) * 1000) / 1000;
+      // Avg cost of remaining open position is unchanged by a sell
+      const avgCostAfter   = openQtyAfter > 0 ? avgCost : 0;
+
+      // Free Shares tracking (capital recovery against this specific lot)
+      if (!investment.originalInvestedAmount || investment.originalInvestedAmount === 0) {
+        investment.originalInvestedAmount = investment.investedAmount || 0;
+      }
       const cumulativeProceeds = (investment.totalProceeds || 0) + totalProceeds;
-      const originalCapital = investment.originalInvestedAmount || investment.investedAmount;
-      const isFreeShares = cumulativeProceeds >= originalCapital && originalCapital > 0;
+      const originalCapital    = investment.originalInvestedAmount || investment.investedAmount;
+      const isFreeShares       = cumulativeProceeds >= originalCapital && originalCapital > 0;
 
-      const remainingUnits = Math.round((availableUnits - unitsToSell) * 1000) / 1000;
-      const remainingInvested = Math.round(remainingUnits * buyPrice * 100) / 100;
-      const remainingValue = Math.round(remainingUnits * sellPrice * 100) / 100;
+      // Remaining units on THIS specific lot document
+      const remainingUnits   = Math.round((availableUnits - unitsToSell) * 1000) / 1000;
+      const remainingValue   = Math.round(remainingUnits * sellPrice * 100) / 100;
 
-      // Create transaction record
+      // ───────────────────────────────────────────────────────────
+      // STEP 3: Persist transaction record with full position context
+      // ───────────────────────────────────────────────────────────
       const transaction = await Transaction.create({
-        userId: req.user._id,
-        investmentId: investment._id,
-        investmentName: investment.name,
-        type: "sell",
-        units: unitsToSell,
-        price: sellPrice,
-        buyPrice,
+        userId:              req.user._id,
+        investmentId:        investment._id,
+        investmentName:      investment.name,
+        symbol:              investment.symbol  || "",
+        exchange:            investment.exchange || "",
+        type:                "sell",
+        units:               unitsToSell,
+        price:               sellPrice,
+        buyPrice:            investment.buyPrice || 0,   // original lot buy price (for reference)
+        avgCostBefore:       Math.round(avgCost * 100) / 100,  // ← position avg cost
         totalProceeds,
         realizedGain,
         realizedGainPercent,
-        capitalRecovered: Math.min(cumulativeProceeds, originalCapital),
+        capitalRecovered:    Math.min(cumulativeProceeds, originalCapital),
         isFreeShares,
-        remainingUnits,
+        openQtyAfter,        // ← total open qty across all lots after this sell
+        avgCostAfter:        Math.round(avgCostAfter * 100) / 100,
+        remainingUnits,      // legacy: units left in this specific lot
         remainingValue,
         sellDate,
         notes,
       });
 
-      // Update investment
-      investment.totalProceeds = cumulativeProceeds;
-      investment.realizedGain = (investment.realizedGain || 0) + realizedGain;
-      investment.units = remainingUnits;
-      investment.investedAmount = remainingInvested;
-      investment.isFreeShare = isFreeShares && remainingUnits > 0;
+      // ───────────────────────────────────────────────────────────
+      // STEP 4: Update the sold lot document
+      // ───────────────────────────────────────────────────────────
+      investment.totalProceeds  = cumulativeProceeds;
+      investment.realizedGain   = (investment.realizedGain || 0) + realizedGain;
+      investment.units          = remainingUnits;
+      investment.investedAmount = Math.round(remainingUnits * avgCost * 100) / 100; // use avg cost
+      investment.isFreeShare    = isFreeShares && remainingUnits > 0;
 
       if (remainingUnits === 0) {
         investment.status = "closed";
@@ -677,28 +730,29 @@ router.post(
       await investment.save();
 
       const obj = investment.toObject();
-      const cv = calcCurrentValue(investment);
+      const cv  = calcCurrentValue(investment);
       obj.currentValue = cv;
-      obj.gain = cv - investment.investedAmount;
-      obj.gainPercent =
-        investment.investedAmount > 0 ? (obj.gain / investment.investedAmount) * 100 : 0;
+      obj.gain         = cv - investment.investedAmount;
+      obj.gainPercent  = investment.investedAmount > 0 ? (obj.gain / investment.investedAmount) * 100 : 0;
 
       res.json({
         success: true,
         message:
           isFreeShares && remainingUnits > 0
-            ? `Sold ${unitsToSell} units. Remaining ${remainingUnits} units are now 100% FREE SHARES!`
-            : `Successfully sold ${unitsToSell} units. Realized profit: ₹${realizedGain.toLocaleString("en-IN")}.`,
+            ? `Sold ${unitsToSell} units at ₹${sellPrice.toLocaleString("en-IN")}. Remaining ${remainingUnits} units are now FREE SHARES!`
+            : `Sold ${unitsToSell} units at avg cost ₹${Math.round(avgCost).toLocaleString("en-IN")}. Realized P&L: ₹${realizedGain.toLocaleString("en-IN")}. Open position: ${openQtyAfter} units.`,
         data: {
           investment: obj,
           transaction,
           summary: {
-            unitsSold: unitsToSell,
+            unitsSold:           unitsToSell,
             sellPrice,
+            avgCostUsed:         Math.round(avgCost * 100) / 100,
             totalProceeds,
             realizedGain,
             realizedGainPercent,
-            remainingUnits,
+            openQtyAfter,
+            avgCostAfter:        Math.round(avgCostAfter * 100) / 100,
             isFreeShares,
             capitalRecoveredPercent:
               originalCapital > 0
@@ -714,6 +768,101 @@ router.post(
   }
 );
 
+// -- GET /api/portfolio/positions ------------------------------------------
+// Aggregates all active lots into "open positions" grouped by symbol+exchange.
+// This is the position-level view the client described:
+//   Buy 1000 AMBUJACEM @ 440 + Buy 870 AMBUJACEM @ 350 = one position, 1870 units @ ₹379.77 avg
+//
+router.get("/positions", async (req, res) => {
+  try {
+    // Only active lots with units > 0 and a symbol (market assets)
+    const lots = await Investment.find({
+      userId: req.user._id,
+      status: "active",
+      units: { $gt: 0 },
+      symbol: { $exists: true, $ne: "" },
+    });
+
+    // Group by symbol+exchange key
+    const posMap = {};
+    lots.forEach((lot) => {
+      const key = `${lot.symbol}__${lot.exchange || ""}`.toUpperCase();
+      if (!posMap[key]) {
+        posMap[key] = {
+          symbol:       lot.symbol,
+          exchange:     lot.exchange || "",
+          name:         lot.name,
+          type:         lot.type,
+          lots:         [],
+          totalUnits:   0,
+          totalCostBasis: 0,
+        };
+      }
+      const pos = posMap[key];
+      const lotUnits = lot.units || 0;
+      const lotBuy   = lot.buyPrice || (lot.investedAmount > 0 && lotUnits > 0 ? lot.investedAmount / lotUnits : 0);
+      pos.lots.push({
+        _id:          lot._id,
+        buyDate:      lot.buyDate,
+        units:        lotUnits,
+        buyPrice:     lotBuy,
+        investedAmount: lot.investedAmount || 0,
+        currentPrice: lot.currentPrice || 0,
+      });
+      pos.totalUnits    += lotUnits;
+      pos.totalCostBasis += lotUnits * lotBuy;
+    });
+
+    // Compute derived position fields
+    const positions = Object.values(posMap).map((pos) => {
+      const avgCost     = pos.totalUnits > 0 ? pos.totalCostBasis / pos.totalUnits : 0;
+      // Use the current price from the most recently updated lot
+      const latestLot   = pos.lots.slice().sort((a, b) => (b.buyDate || 0) > (a.buyDate || 0) ? 1 : -1)[0];
+      const currentPrice = latestLot?.currentPrice || 0;
+      const currentValue = pos.totalUnits * currentPrice;
+      const totalInvested = pos.totalCostBasis;
+      const unrealisedGain = currentPrice > 0 ? currentValue - totalInvested : 0;
+      const returnPct    = totalInvested > 0 && currentPrice > 0
+        ? ((currentValue - totalInvested) / totalInvested) * 100 : 0;
+
+      return {
+        symbol:         pos.symbol,
+        exchange:       pos.exchange,
+        name:           pos.name,
+        type:           pos.type,
+        lotCount:       pos.lots.length,
+        totalUnits:     Math.round(pos.totalUnits * 1000) / 1000,
+        avgCost:        Math.round(avgCost * 100) / 100,
+        totalInvested:  Math.round(totalInvested * 100) / 100,
+        currentPrice,
+        currentValue:   Math.round(currentValue * 100) / 100,
+        unrealisedGain: Math.round(unrealisedGain * 100) / 100,
+        returnPct:      Math.round(returnPct * 100) / 100,
+        lots:           pos.lots,
+      };
+    }).sort((a, b) => Math.abs(b.unrealisedGain) - Math.abs(a.unrealisedGain));
+
+    const totalInvested   = positions.reduce((s, p) => s + p.totalInvested, 0);
+    const totalCurrentVal = positions.reduce((s, p) => s + p.currentValue, 0);
+
+    res.json({
+      success: true,
+      data: positions,
+      count: positions.length,
+      summary: {
+        totalPositions: positions.length,
+        totalUnderlyingLots: lots.length,
+        totalInvested:   Math.round(totalInvested * 100) / 100,
+        totalCurrentValue: Math.round(totalCurrentVal * 100) / 100,
+        totalUnrealisedGain: Math.round((totalCurrentVal - totalInvested) * 100) / 100,
+      },
+    });
+  } catch (err) {
+    console.error("Get positions error:", err);
+    res.status(500).json({ success: false, message: "Server error fetching positions." });
+  }
+});
+
 // -- GET /api/portfolio/transactions ---------------------------------------
 router.get("/transactions", async (req, res) => {
   try {
@@ -727,7 +876,7 @@ router.get("/transactions", async (req, res) => {
 
     const totalRealizedProfit = transactions.reduce((acc, t) => acc + (t.realizedGain || 0), 0);
     const totalProceeds = transactions.reduce((acc, t) => acc + (t.totalProceeds || 0), 0);
-    const totalCostBasis = transactions.reduce((acc, t) => acc + (t.units * (t.buyPrice || 0)), 0);
+    const totalCostBasis = transactions.reduce((acc, t) => acc + (t.units * (t.avgCostBefore || t.buyPrice || 0)), 0);
     const profitableCount = transactions.filter((t) => (t.realizedGain || 0) > 0).length;
     const lossCount = transactions.filter((t) => (t.realizedGain || 0) < 0).length;
     const freeSharesCount = transactions.filter((t) => t.isFreeShares).length;
@@ -760,4 +909,5 @@ router.get("/transactions", async (req, res) => {
 });
 
 module.exports = router;
+
 

@@ -9,6 +9,7 @@ const Lead = require("../models/Lead");
 const SiteContent = require("../models/SiteContent");
 const Service = require("../models/Service");
 const Faq = require("../models/Faq");
+const ProductPrice = require("../models/ProductPrice");
 
 const router = express.Router();
 
@@ -1039,6 +1040,323 @@ router.get("/users/:id/transactions", async (req, res) => {
   } catch (err) {
     console.error("Admin fetch user transactions error:", err);
     res.status(500).json({ success: false, message: "Failed to fetch user transaction history." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. MASTER PRODUCT PRICES & BULK PRICING OVERRIDE
+// ─────────────────────────────────────────────────────────────────────────────
+function escapeRegex(text) {
+  return (text || "").replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+}
+
+async function applyProductPrice(item, adminUserId) {
+  const name = (item.name || "").trim();
+  const symbol = (item.symbol || "").trim();
+  const type = (item.type || "").trim();
+  const price = parseFloat(item.price);
+  const notes = (item.notes || "").trim();
+
+  if (isNaN(price) || price <= 0) {
+    return { name, symbol, updated: false, reason: "Price must be a positive number greater than 0" };
+  }
+  if (!name && !symbol) {
+    return { name, symbol, updated: false, reason: "Product Name or Symbol is required" };
+  }
+
+  // Build match query for Investments
+  const orConditions = [];
+  if (symbol) {
+    orConditions.push({ symbol: { $regex: `^${escapeRegex(symbol)}$`, $options: "i" } });
+  }
+  if (name) {
+    orConditions.push({ name: { $regex: `^${escapeRegex(name)}$`, $options: "i" } });
+  }
+
+  const query = { $or: orConditions };
+  if (type && type !== "all") {
+    if (type === "mutual_fund" || type === "sip") {
+      query.type = { $in: ["mutual_fund", "sip"] };
+    } else {
+      query.type = type;
+    }
+  }
+
+  // 1. Bulk update all matching investments across all users in the system
+  const updateResult = await Investment.updateMany(query, {
+    $set: {
+      currentPrice: price,
+      lastPriceUpdate: new Date(),
+    },
+  });
+
+  // 2. Upsert into ProductPrice master catalog
+  const ppFilter = symbol
+    ? { symbol: symbol.toUpperCase() }
+    : { name: { $regex: `^${escapeRegex(name)}$`, $options: "i" } };
+
+  const existingPP = await ProductPrice.findOne(ppFilter);
+
+  await ProductPrice.findOneAndUpdate(
+    ppFilter,
+    {
+      $set: {
+        name: name || (existingPP ? existingPP.name : symbol),
+        symbol: symbol.toUpperCase(),
+        type: type || (existingPP ? existingPP.type : "stock"),
+        price,
+        previousPrice: existingPP ? existingPP.price : price,
+        source: item.source || "manual_admin",
+        notes: notes || (existingPP ? existingPP.notes : ""),
+        updatedBy: adminUserId || null,
+        lastUpdated: new Date(),
+      },
+    },
+    { upsert: true, new: true }
+  );
+
+  return {
+    name: name || (existingPP ? existingPP.name : symbol),
+    symbol: symbol.toUpperCase(),
+    type: type || "stock",
+    price,
+    modifiedCount: updateResult.modifiedCount,
+    updated: true,
+  };
+}
+
+// GET /api/admin/prices — List all distinct products held across clients + manual overrides
+router.get("/prices", async (req, res) => {
+  try {
+    const { search, type, status } = req.query;
+
+    // 1. Fetch all manual price overrides from ProductPrice
+    const overrides = await ProductPrice.find().lean();
+    const overrideMap = new Map();
+    overrides.forEach((o) => {
+      if (o.symbol) overrideMap.set(o.symbol.toUpperCase(), o);
+      if (o.name) overrideMap.set(o.name.toLowerCase().trim(), o);
+    });
+
+    // 2. Aggregate unique products from Investment collection
+    const pipeline = [
+      {
+        $group: {
+          _id: {
+            name: { $trim: { input: "$name" } },
+            symbol: { $toUpper: { $trim: { input: "$symbol" } } },
+            type: "$type",
+          },
+          exchange: { $first: "$exchange" },
+          sampleCurrentPrice: { $max: "$currentPrice" },
+          lastPriceUpdate: { $max: "$lastPriceUpdate" },
+          clients: { $addToSet: "$userId" },
+          totalUnits: { $sum: "$units" },
+          totalInvested: { $sum: "$investedAmount" },
+          holdingsCount: { $sum: 1 },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          name: "$_id.name",
+          symbol: "$_id.symbol",
+          type: "$_id.type",
+          exchange: "$exchange",
+          currentPrice: "$sampleCurrentPrice",
+          lastPriceUpdate: "$lastPriceUpdate",
+          clientsCount: { $size: "$clients" },
+          totalUnits: "$totalUnits",
+          totalInvested: "$totalInvested",
+          holdingsCount: "$holdingsCount",
+        },
+      },
+      { $sort: { holdingsCount: -1, totalInvested: -1 } },
+    ];
+
+    let products = await Investment.aggregate(pipeline);
+
+    // Also include any ProductPrice overrides that may not currently be in any client holdings
+    const existingKeys = new Set(
+      products.map((p) => (p.symbol ? p.symbol.toUpperCase() : p.name.toLowerCase().trim()))
+    );
+
+    overrides.forEach((o) => {
+      const key = o.symbol ? o.symbol.toUpperCase() : o.name.toLowerCase().trim();
+      if (!existingKeys.has(key)) {
+        products.push({
+          name: o.name,
+          symbol: o.symbol,
+          type: o.type,
+          exchange: o.exchange || "",
+          currentPrice: o.price,
+          lastPriceUpdate: o.lastUpdated,
+          clientsCount: 0,
+          totalUnits: 0,
+          totalInvested: 0,
+          holdingsCount: 0,
+          isManual: true,
+          manualNotes: o.notes,
+        });
+      }
+    });
+
+    // Enhance each product with override status & live status
+    products = products.map((p) => {
+      const override =
+        (p.symbol && overrideMap.get(p.symbol.toUpperCase())) ||
+        (p.name && overrideMap.get(p.name.toLowerCase().trim()));
+      const isManual = !!override;
+      const effectivePrice = override ? override.price : (p.currentPrice || 0);
+      const isMissingPrice = effectivePrice <= 0;
+
+      return {
+        ...p,
+        currentPrice: effectivePrice,
+        previousPrice: override ? override.previousPrice : effectivePrice,
+        isManual,
+        isMissingPrice,
+        manualNotes: override?.notes || "",
+        lastUpdated: override?.lastUpdated || p.lastPriceUpdate || null,
+        source: override ? override.source : (effectivePrice > 0 ? "api_sync" : "missing"),
+      };
+    });
+
+    // High level stats calculated across all unfiltered products
+    const totalProducts = products.length;
+    const unpricedCount = products.filter((p) => p.isMissingPrice).length;
+    const manualCount = products.filter((p) => p.isManual).length;
+    const liveCount = totalProducts - unpricedCount - manualCount;
+    const totalHoldingsCount = products.reduce((acc, p) => acc + (p.holdingsCount || 0), 0);
+    const totalInvestedSum = products.reduce((acc, p) => acc + (p.totalInvested || 0), 0);
+
+    // Filter by search, type, and status
+    if (search && search.trim()) {
+      const s = search.trim().toLowerCase();
+      products = products.filter(
+        (p) =>
+          (p.name && p.name.toLowerCase().includes(s)) ||
+          (p.symbol && p.symbol.toLowerCase().includes(s))
+      );
+    }
+
+    if (type && type !== "all") {
+      products = products.filter((p) => p.type === type);
+    }
+
+    if (status === "missing") {
+      products = products.filter((p) => p.isMissingPrice);
+    } else if (status === "manual") {
+      products = products.filter((p) => p.isManual);
+    } else if (status === "live") {
+      products = products.filter((p) => !p.isMissingPrice && !p.isManual);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        products,
+        stats: {
+          totalProducts,
+          unpricedCount,
+          manualCount,
+          liveCount,
+          totalHoldingsCount,
+          totalInvestedSum,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("Admin get prices error:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch product prices." });
+  }
+});
+
+// PUT /api/admin/prices — Update single product price across all client holdings
+router.put(
+  "/prices",
+  [
+    body("price").isFloat({ gt: 0 }).withMessage("Price must be a positive number greater than 0"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const result = await applyProductPrice(
+        {
+          name: req.body.name,
+          symbol: req.body.symbol,
+          type: req.body.type,
+          price: req.body.price,
+          notes: req.body.notes,
+          source: "manual_admin",
+        },
+        req.user?._id
+      );
+
+      if (!result.updated) {
+        return res.status(400).json({ success: false, message: result.reason });
+      }
+
+      res.json({
+        success: true,
+        data: result,
+        message: `Successfully updated price to ₹${result.price.toLocaleString("en-IN")} across ${result.modifiedCount} client holdings.`,
+      });
+    } catch (err) {
+      console.error("Admin update price error:", err);
+      res.status(500).json({ success: false, message: "Failed to update product price." });
+    }
+  }
+);
+
+// POST /api/admin/prices/bulk — Bulk update product prices from Excel upload / batch edit
+router.post("/prices/bulk", async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No product price items provided. Expected an array of price updates.",
+      });
+    }
+
+    const results = [];
+    let updatedProductsCount = 0;
+    let totalHoldingsUpdated = 0;
+
+    for (const item of items) {
+      if (!item || !item.price || isNaN(parseFloat(item.price)) || parseFloat(item.price) <= 0) {
+        continue;
+      }
+      const resItem = await applyProductPrice(
+        {
+          ...item,
+          source: item.source || "excel_upload",
+        },
+        req.user?._id
+      );
+
+      if (resItem.updated) {
+        updatedProductsCount++;
+        totalHoldingsUpdated += resItem.modifiedCount || 0;
+        results.push(resItem);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Bulk update complete. Updated ${updatedProductsCount} products affecting ${totalHoldingsUpdated} client holdings.`,
+      updatedProductsCount,
+      totalHoldingsUpdated,
+      details: results,
+    });
+  } catch (err) {
+    console.error("Admin bulk update prices error:", err);
+    res.status(500).json({ success: false, message: "Failed to execute bulk price updates." });
   }
 });
 

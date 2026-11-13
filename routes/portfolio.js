@@ -132,6 +132,84 @@ router.get("/summary", async (req, res) => {
   }
 });
 
+// ── Tax classification helper ──────────────────────────────────────────────
+// Indian FY2024-25 rules (post-Budget 2024):
+//   Equity / Equity MF / REIT-InvIT : LTCG if > 12 months  → 12.5% (above ₹1.25L exempt)
+//   Debt MF / Bond / FD / PPF / EPF  : always at slab rate (no indexation)
+//   Gold / AIF / NPS / Other         : LTCG if > 24 months  → 12.5%
+//   Crypto                            : flat 30% regardless of holding period
+function calcTaxInfo(inv, currentValue) {
+  const buyDate  = inv.buyDate || inv.sipStartDate || inv.createdAt;
+  const today    = new Date();
+  const holdingDays = buyDate
+    ? Math.floor((today - new Date(buyDate)) / (1000 * 60 * 60 * 24))
+    : null;
+
+  const gain     = currentValue - (inv.investedAmount || 0);
+  const type     = inv.type || "";
+
+  // Determine LTCG threshold in days per asset class
+  let ltcgThresholdDays = 365; // default: equity
+  let taxRegime = "equity";    // equity | debt | flat30
+
+  if (["mutual_fund", "sip"].includes(type)) {
+    const cat = (inv.category || "").toLowerCase();
+    if (cat === "debt") {
+      taxRegime = "debt";
+      ltcgThresholdDays = Infinity; // always slab
+    } else {
+      taxRegime = "equity"; // equity MF
+      ltcgThresholdDays = 365;
+    }
+  } else if (["stock", "reit_invit"].includes(type)) {
+    taxRegime = "equity";
+    ltcgThresholdDays = 365;
+  } else if (["fd", "ppf", "epf", "bond", "nps"].includes(type)) {
+    taxRegime = "debt";
+    ltcgThresholdDays = Infinity;
+  } else if (["gold", "aif"].includes(type)) {
+    taxRegime = "other";
+    ltcgThresholdDays = 730; // 2 years (changed from 3yr post-Budget 2024)
+  } else if (type === "crypto") {
+    taxRegime = "flat30";
+    ltcgThresholdDays = Infinity;
+  }
+
+  let taxLabel   = "STCG";
+  let taxRate    = null;
+  let estimatedTax = 0;
+
+  if (taxRegime === "flat30") {
+    taxLabel = "Flat 30%";
+    taxRate  = 30;
+    estimatedTax = gain > 0 ? Math.round(gain * 0.30) : 0;
+  } else if (taxRegime === "debt") {
+    taxLabel = "Slab Rate";
+    taxRate  = null; // depends on user's income slab
+    estimatedTax = null; // can't compute without slab
+  } else {
+    // equity / other
+    const isLTCG = holdingDays !== null && holdingDays >= ltcgThresholdDays;
+    if (isLTCG) {
+      taxLabel = "LTCG";
+      taxRate  = 12.5;
+      // Equity LTCG: ₹1.25L exempt per year (we show gross tax here)
+      estimatedTax = gain > 0 ? Math.round(gain * 0.125) : 0;
+    } else {
+      taxLabel = "STCG";
+      taxRate  = 20; // post-Budget 2024 (was 15%)
+      estimatedTax = gain > 0 ? Math.round(gain * 0.20) : 0;
+    }
+  }
+
+  return {
+    holdingDays,
+    taxLabel,     // "STCG" | "LTCG" | "Slab Rate" | "Flat 30%"
+    taxRate,      // number or null
+    estimatedTax, // ₹ or null
+  };
+}
+
 // -- GET /api/portfolio ----------------------------------------------------
 router.get("/", async (req, res) => {
   try {
@@ -158,11 +236,19 @@ router.get("/", async (req, res) => {
     // Attach computed fields to each investment
     const result = investments.map((inv) => {
       const obj = inv.toObject();
-      const cv = calcCurrentValue(inv);
-      obj.currentValue = cv;
-      obj.gain = cv - (inv.investedAmount || 0);
-      obj.gainPercent = (inv.investedAmount || 0) > 0
+      const cv  = calcCurrentValue(inv);
+      obj.currentValue  = cv;
+      obj.gain          = cv - (inv.investedAmount || 0);
+      obj.gainPercent   = (inv.investedAmount || 0) > 0
         ? (obj.gain / inv.investedAmount) * 100 : 0;
+
+      // ── Tax & holding period fields ──────────────────────────────
+      const tax = calcTaxInfo(inv, cv);
+      obj.holdingDays   = tax.holdingDays;
+      obj.taxLabel      = tax.taxLabel;
+      obj.taxRate       = tax.taxRate;
+      obj.estimatedTax  = tax.estimatedTax;
+
       return obj;
     });
 

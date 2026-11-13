@@ -3,6 +3,7 @@ const jwt = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
 const { requireAdmin } = require("../middleware/admin");
 const User = require("../models/User");
+const { sendAdminCreatedAccountEmail } = require("../services/emailService");
 const Investment = require("../models/Investment");
 const Transaction = require("../models/Transaction");
 const Lead = require("../models/Lead");
@@ -274,6 +275,53 @@ function calcCurrentValue(inv) {
   return inv.investedAmount || 0;
 }
 
+function calcTaxInfo(inv, currentValue) {
+  const buyDate = inv.buyDate || inv.sipStartDate || inv.createdAt;
+  const today = new Date();
+  const holdingDays = buyDate
+    ? Math.floor((today - new Date(buyDate)) / (1000 * 60 * 60 * 24))
+    : null;
+
+  const gain = currentValue - (inv.investedAmount || 0);
+  const type = inv.type || "";
+
+  let ltcgThresholdDays = 365;
+  let taxRegime = "equity";
+
+  if (["mutual_fund", "sip"].includes(type)) {
+    const cat = (inv.category || "").toLowerCase();
+    taxRegime = cat === "debt" ? "debt" : "equity";
+    ltcgThresholdDays = cat === "debt" ? Infinity : 365;
+  } else if (["stock", "reit_invit"].includes(type)) {
+    taxRegime = "equity"; ltcgThresholdDays = 365;
+  } else if (["fd", "ppf", "epf", "bond", "nps"].includes(type)) {
+    taxRegime = "debt"; ltcgThresholdDays = Infinity;
+  } else if (["gold", "aif"].includes(type)) {
+    taxRegime = "other"; ltcgThresholdDays = 730;
+  } else if (type === "crypto") {
+    taxRegime = "flat30"; ltcgThresholdDays = Infinity;
+  }
+
+  let taxLabel = "STCG", taxRate = null, estimatedTax = 0;
+
+  if (taxRegime === "flat30") {
+    taxLabel = "Flat 30%"; taxRate = 30;
+    estimatedTax = gain > 0 ? Math.round(gain * 0.30) : 0;
+  } else if (taxRegime === "debt") {
+    taxLabel = "Slab Rate"; taxRate = null; estimatedTax = null;
+  } else {
+    const isLTCG = holdingDays !== null && holdingDays >= ltcgThresholdDays;
+    if (isLTCG) {
+      taxLabel = "LTCG"; taxRate = 12.5;
+      estimatedTax = gain > 0 ? Math.round(gain * 0.125) : 0;
+    } else {
+      taxLabel = "STCG"; taxRate = 20;
+      estimatedTax = gain > 0 ? Math.round(gain * 0.20) : 0;
+    }
+  }
+  return { holdingDays, taxLabel, taxRate, estimatedTax };
+}
+
 router.get("/users/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id)
@@ -307,12 +355,17 @@ router.get("/users/:id", async (req, res) => {
       byType[inv.type].invested += invested;
       byType[inv.type].currentValue += cv;
 
+      const tax = calcTaxInfo(inv, cv);
       const obj = inv.toObject();
       return {
         ...obj,
         currentValue: Math.round(cv * 100) / 100,
         gain: Math.round(gain * 100) / 100,
         gainPercent: Math.round(gainPercent * 100) / 100,
+        holdingDays: tax.holdingDays,
+        taxLabel: tax.taxLabel,
+        taxRate: tax.taxRate,
+        estimatedTax: tax.estimatedTax,
       };
     });
 
@@ -401,6 +454,11 @@ router.post(
         authProvider: "local",
         isActive: true,
       });
+
+      // Email user their login credentials (fire async, don't block response)
+      sendAdminCreatedAccountEmail(user, password).catch((e) =>
+        console.error("[Email] Admin-created account email failed:", e.message)
+      );
 
       const userObj = {
         id: user._id.toString(),
@@ -873,6 +931,110 @@ router.patch("/investments/:id/category", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 7b. BULK INVESTMENT IMPORT — POST /api/admin/users/:id/investments/bulk-import
+// Admin uploads a parsed Excel/CSV (as JSON array) to add multiple holdings
+// for a specific user in one shot.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post("/users/:id/investments/bulk-import", async (req, res) => {
+  try {
+    const { id: userId } = req.params;
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found." });
+    }
+
+    const { rows } = req.body; // array of investment objects
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ success: false, message: "No rows provided. Send { rows: [...] }" });
+    }
+
+    const VALID_TYPES = ["stock", "mutual_fund", "sip", "ppf", "epf", "fd", "nps", "bond", "gold", "crypto", "aif", "reit_invit"];
+    const VALID_CATEGORIES = ["equity", "debt", "elss", "others", "hybrid", ""];
+
+    const created = [];
+    const skipped = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const rowNum = i + 2; // 1-indexed, +1 for header
+
+      // ── Validate required fields ──────────────────────────────────
+      const type = (row.type || "").toLowerCase().trim();
+      if (!VALID_TYPES.includes(type)) {
+        skipped.push({ row: rowNum, name: row.name, reason: `Invalid type "${row.type}". Must be one of: ${VALID_TYPES.join(", ")}` });
+        continue;
+      }
+
+      const name = (row.name || "").trim();
+      if (!name) {
+        skipped.push({ row: rowNum, name: "-", reason: "Name is required" });
+        continue;
+      }
+
+      const investedAmount = parseFloat(row.investedAmount || row.invested_amount || 0);
+      if (isNaN(investedAmount) || investedAmount < 0) {
+        skipped.push({ row: rowNum, name, reason: "investedAmount must be a positive number" });
+        continue;
+      }
+
+      // ── Build the investment document ─────────────────────────────
+      const doc = {
+        userId,
+        type,
+        name,
+        symbol:        (row.symbol        || "").trim().toUpperCase() || undefined,
+        exchange:      (row.exchange       || "").trim().toUpperCase() || undefined,
+        folioNumber:   (row.folioNumber    || row.folio_number || "").trim() || undefined,
+        units:         parseFloat(row.units)         || 0,
+        buyPrice:      parseFloat(row.buyPrice       || row.buy_price) || 0,
+        buyDate:       row.buyDate || row.buy_date   ? new Date(row.buyDate || row.buy_date) : undefined,
+        investedAmount,
+        currentPrice:  parseFloat(row.currentPrice   || row.current_price) || 0,
+        // SIP
+        sipAmount:     parseFloat(row.sipAmount      || row.sip_amount) || 0,
+        sipStartDate:  row.sipStartDate || row.sip_start_date ? new Date(row.sipStartDate || row.sip_start_date) : undefined,
+        instalments:   parseInt(row.instalments)     || 0,
+        avgNav:        parseFloat(row.avgNav         || row.avg_nav) || 0,
+        // Fixed income
+        principal:     parseFloat(row.principal)     || 0,
+        interestRate:  parseFloat(row.interestRate   || row.interest_rate) || 0,
+        maturityDate:  row.maturityDate || row.maturity_date ? new Date(row.maturityDate || row.maturity_date) : undefined,
+        tenureMonths:  parseInt(row.tenureMonths     || row.tenure_months) || 0,
+        institution:   (row.institution  || "").trim() || undefined,
+        // Meta
+        category:      VALID_CATEGORIES.includes((row.category || "").toLowerCase().trim())
+                         ? (row.category || "").toLowerCase().trim()
+                         : "",
+        notes:         (row.notes || "").trim() || undefined,
+        status:        "active",
+      };
+
+      // Remove undefined keys so Mongoose defaults apply cleanly
+      Object.keys(doc).forEach((k) => doc[k] === undefined && delete doc[k]);
+
+      try {
+        const inv = await Investment.create(doc);
+        created.push({ row: rowNum, name, type, investedAmount, id: inv._id });
+      } catch (createErr) {
+        skipped.push({ row: rowNum, name, reason: createErr.message });
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `Import complete. ${created.length} holdings added, ${skipped.length} skipped.`,
+      importedCount:  created.length,
+      skippedCount:   skipped.length,
+      created,
+      skipped,
+    });
+  } catch (err) {
+    console.error("Admin bulk import investments error:", err);
+    res.status(500).json({ success: false, message: "Server error during bulk import." });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 8. ADMIN SELL / CAPITAL FREEING OPERATION
 // ─────────────────────────────────────────────────────────────────────────────
 router.post(
@@ -1051,11 +1213,12 @@ function escapeRegex(text) {
 }
 
 async function applyProductPrice(item, adminUserId) {
-  const name = (item.name || "").trim();
+  const name  = (item.name   || "").trim();
   const symbol = (item.symbol || "").trim();
-  const type = (item.type || "").trim();
-  const price = parseFloat(item.price);
-  const notes = (item.notes || "").trim();
+  const type   = (item.type   || "").trim();
+  const price  = parseFloat(item.price);
+  const notes  = (item.notes  || "").trim();
+  const staleAfterDays = item.staleAfterDays ? parseInt(item.staleAfterDays, 10) : undefined;
 
   if (isNaN(price) || price <= 0) {
     return { name, symbol, updated: false, reason: "Price must be a positive number greater than 0" };
@@ -1066,12 +1229,8 @@ async function applyProductPrice(item, adminUserId) {
 
   // Build match query for Investments
   const orConditions = [];
-  if (symbol) {
-    orConditions.push({ symbol: { $regex: `^${escapeRegex(symbol)}$`, $options: "i" } });
-  }
-  if (name) {
-    orConditions.push({ name: { $regex: `^${escapeRegex(name)}$`, $options: "i" } });
-  }
+  if (symbol) orConditions.push({ symbol: { $regex: `^${escapeRegex(symbol)}$`, $options: "i" } });
+  if (name)   orConditions.push({ name:   { $regex: `^${escapeRegex(name)}$`,   $options: "i" } });
 
   const query = { $or: orConditions };
   if (type && type !== "all") {
@@ -1082,46 +1241,56 @@ async function applyProductPrice(item, adminUserId) {
     }
   }
 
-  // 1. Bulk update all matching investments across all users in the system
+  // 1. Bulk-update all matching investments across all users
   const updateResult = await Investment.updateMany(query, {
-    $set: {
-      currentPrice: price,
-      lastPriceUpdate: new Date(),
-    },
+    $set: { currentPrice: price, lastPriceUpdate: new Date() },
   });
 
-  // 2. Upsert into ProductPrice master catalog
+  // 2. Upsert into ProductPrice master catalog + append to priceHistory
   const ppFilter = symbol
     ? { symbol: symbol.toUpperCase() }
     : { name: { $regex: `^${escapeRegex(name)}$`, $options: "i" } };
 
   const existingPP = await ProductPrice.findOne(ppFilter);
 
+  const historyEntry = {
+    price,
+    updatedBy: adminUserId || null,
+    source: item.source || "manual_admin",
+    notes: notes || "Price update",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  const setFields = {
+    name:          name || (existingPP ? existingPP.name : symbol),
+    symbol:        symbol.toUpperCase(),
+    type:          type || (existingPP ? existingPP.type : "stock"),
+    price,
+    previousPrice: existingPP ? existingPP.price : price,
+    source:        item.source || "manual_admin",
+    notes:         notes || (existingPP ? existingPP.notes : ""),
+    updatedBy:     adminUserId || null,
+    lastUpdated:   new Date(),
+  };
+  if (staleAfterDays) setFields.staleAfterDays = staleAfterDays;
+
   await ProductPrice.findOneAndUpdate(
     ppFilter,
     {
-      $set: {
-        name: name || (existingPP ? existingPP.name : symbol),
-        symbol: symbol.toUpperCase(),
-        type: type || (existingPP ? existingPP.type : "stock"),
-        price,
-        previousPrice: existingPP ? existingPP.price : price,
-        source: item.source || "manual_admin",
-        notes: notes || (existingPP ? existingPP.notes : ""),
-        updatedBy: adminUserId || null,
-        lastUpdated: new Date(),
-      },
+      $set:  setFields,
+      $push: { priceHistory: { $each: [historyEntry], $slice: -120 } }, // keep last 120 entries
     },
     { upsert: true, new: true }
   );
 
   return {
-    name: name || (existingPP ? existingPP.name : symbol),
-    symbol: symbol.toUpperCase(),
-    type: type || "stock",
+    name:          name || (existingPP ? existingPP.name : symbol),
+    symbol:        symbol.toUpperCase(),
+    type:          type || "stock",
     price,
     modifiedCount: updateResult.modifiedCount,
-    updated: true,
+    updated:       true,
   };
 }
 
@@ -1201,34 +1370,50 @@ router.get("/prices", async (req, res) => {
       }
     });
 
-    // Enhance each product with override status & live status
+    // Enhance each product with override status, live status, and staleness
     products = products.map((p) => {
       const override =
         (p.symbol && overrideMap.get(p.symbol.toUpperCase())) ||
-        (p.name && overrideMap.get(p.name.toLowerCase().trim()));
-      const isManual = !!override;
+        (p.name   && overrideMap.get(p.name.toLowerCase().trim()));
+      const isManual      = !!override;
       const effectivePrice = override ? override.price : (p.currentPrice || 0);
       const isMissingPrice = effectivePrice <= 0;
 
+      // Staleness calculation
+      const lastUpdated    = override?.lastUpdated || p.lastPriceUpdate || null;
+      const staleAfterDays = override?.staleAfterDays || 30;
+      const daysSinceUpdate = lastUpdated
+        ? Math.floor((Date.now() - new Date(lastUpdated).getTime()) / (1000 * 60 * 60 * 24))
+        : null;
+      const isStale = daysSinceUpdate !== null && daysSinceUpdate >= staleAfterDays;
+
       return {
         ...p,
-        currentPrice: effectivePrice,
+        currentPrice:  effectivePrice,
         previousPrice: override ? override.previousPrice : effectivePrice,
         isManual,
         isMissingPrice,
-        manualNotes: override?.notes || "",
-        lastUpdated: override?.lastUpdated || p.lastPriceUpdate || null,
-        source: override ? override.source : (effectivePrice > 0 ? "api_sync" : "missing"),
+        manualNotes:    override?.notes || "",
+        lastUpdated,
+        source:         override ? override.source : (effectivePrice > 0 ? "api_sync" : "missing"),
+        // ─ staleness fields (new) ─
+        staleAfterDays,
+        daysSinceUpdate,
+        isStale,
+        priceHistory:   override?.priceHistory
+          ? override.priceHistory.slice(-12).reverse()  // last 12 entries, newest first
+          : [],
       };
     });
 
     // High level stats calculated across all unfiltered products
-    const totalProducts = products.length;
-    const unpricedCount = products.filter((p) => p.isMissingPrice).length;
-    const manualCount = products.filter((p) => p.isManual).length;
-    const liveCount = totalProducts - unpricedCount - manualCount;
-    const totalHoldingsCount = products.reduce((acc, p) => acc + (p.holdingsCount || 0), 0);
-    const totalInvestedSum = products.reduce((acc, p) => acc + (p.totalInvested || 0), 0);
+    const totalProducts       = products.length;
+    const unpricedCount       = products.filter((p) => p.isMissingPrice).length;
+    const manualCount         = products.filter((p) => p.isManual).length;
+    const staleCount          = products.filter((p) => p.isStale && p.isManual).length;
+    const liveCount           = totalProducts - unpricedCount - manualCount;
+    const totalHoldingsCount  = products.reduce((acc, p) => acc + (p.holdingsCount || 0), 0);
+    const totalInvestedSum    = products.reduce((acc, p) => acc + (p.totalInvested  || 0), 0);
 
     // Filter by search, type, and status
     if (search && search.trim()) {
@@ -1260,6 +1445,7 @@ router.get("/prices", async (req, res) => {
           totalProducts,
           unpricedCount,
           manualCount,
+          staleCount,
           liveCount,
           totalHoldingsCount,
           totalInvestedSum,
@@ -1333,10 +1519,7 @@ router.post("/prices/bulk", async (req, res) => {
         continue;
       }
       const resItem = await applyProductPrice(
-        {
-          ...item,
-          source: item.source || "excel_upload",
-        },
+        { ...item, source: item.source || "excel_upload" },
         req.user?._id
       );
 
@@ -1360,4 +1543,60 @@ router.post("/prices/bulk", async (req, res) => {
   }
 });
 
+// POST /api/admin/prices/sync-overrides — Re-apply ALL ProductPrice overrides to client holdings
+// Use this for regular price refresh without re-uploading Excel.
+// Propagates every record in ProductPrice catalog to all matching Investment documents.
+router.post("/prices/sync-overrides", async (req, res) => {
+  try {
+    const overrides = await ProductPrice.find({ price: { $gt: 0 } }).lean();
+    if (overrides.length === 0) {
+      return res.json({
+        success: true,
+        message: "No manual price overrides found in catalog.",
+        updatedProductsCount: 0,
+        totalHoldingsUpdated: 0,
+      });
+    }
+
+    let updatedProductsCount = 0;
+    let totalHoldingsUpdated = 0;
+    const results = [];
+
+    for (const override of overrides) {
+      const orConditions = [];
+      if (override.symbol) orConditions.push({ symbol: { $regex: `^${escapeRegex(override.symbol)}$`, $options: "i" } });
+      if (override.name)   orConditions.push({ name:   { $regex: `^${escapeRegex(override.name)}$`,   $options: "i" } });
+      if (orConditions.length === 0) continue;
+
+      const updateResult = await Investment.updateMany(
+        { $or: orConditions },
+        { $set: { currentPrice: override.price, lastPriceUpdate: new Date() } }
+      );
+
+      if (updateResult.modifiedCount > 0) {
+        updatedProductsCount++;
+        totalHoldingsUpdated += updateResult.modifiedCount;
+        results.push({
+          name:          override.name,
+          symbol:        override.symbol,
+          price:         override.price,
+          modifiedCount: updateResult.modifiedCount,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Re-sync complete. Applied ${updatedProductsCount} price overrides to ${totalHoldingsUpdated} client holdings.`,
+      updatedProductsCount,
+      totalHoldingsUpdated,
+      details: results,
+    });
+  } catch (err) {
+    console.error("Admin sync overrides error:", err);
+    res.status(500).json({ success: false, message: "Failed to sync price overrides." });
+  }
+});
+
 module.exports = router;
+

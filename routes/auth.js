@@ -7,6 +7,9 @@ const { protect } = require("../middleware/auth");
 const { OAuth2Client } = require("google-auth-library");
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
+const crypto = require("crypto");
+const { sendWelcomeEmail, sendNewUserAdminAlert, sendPasswordResetEmail } = require("../services/emailService");
+
 const router = express.Router();
 
 // Helper: generate JWT
@@ -83,6 +86,10 @@ router.post(
         phone: (phone || "").trim(),
         riskProfile: riskProfile || "moderate",
       });
+
+      // Fire emails async — don't block the token response
+      sendWelcomeEmail(user).catch((e) => console.error("[Email] Welcome email failed:", e.message));
+      sendNewUserAdminAlert(user).catch((e) => console.error("[Email] New user admin alert failed:", e.message));
 
       sendTokenResponse(user, 201, res);
     } catch (error) {
@@ -332,6 +339,110 @@ router.post(
     } catch (error) {
       console.error("Change password error:", error);
       res.status(500).json({ success: false, message: "Server error." });
+    }
+  }
+);
+
+// --- POST /api/auth/forgot-password ----------------------------------------
+// Accepts an email, generates a secure reset token, emails a reset link.
+router.post(
+  "/forgot-password",
+  [body("email").isEmail().normalizeEmail().withMessage("Valid email required")],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg });
+    }
+
+    try {
+      const user = await User.findOne({ email: req.body.email });
+
+      // Always return success — don't reveal whether the email exists
+      if (!user || !user.isActive) {
+        return res.json({
+          success: true,
+          message: "If that email is registered, a reset link has been sent.",
+        });
+      }
+
+      // Generate a cryptographically secure token (hex, 32 bytes = 64 chars)
+      const rawToken   = crypto.randomBytes(32).toString("hex");
+      const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+
+      user.resetPasswordToken   = hashedToken;
+      user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      await user.save({ validateBeforeSave: false });
+
+      // Send email with the RAW (unhashed) token in the URL
+      await sendPasswordResetEmail(user, rawToken);
+
+      res.json({
+        success: true,
+        message: "If that email is registered, a reset link has been sent.",
+      });
+    } catch (error) {
+      console.error("Forgot password error:", error);
+      res.status(500).json({ success: false, message: "Server error. Please try again." });
+    }
+  }
+);
+
+// --- POST /api/auth/reset-password/:token ----------------------------------
+// Validates the token from the email link and sets the new password.
+router.post(
+  "/reset-password/:token",
+  [
+    body("newPassword")
+      .isLength({ min: 6 })
+      .withMessage("Password must be at least 6 characters"),
+    body("confirmPassword")
+      .notEmpty()
+      .withMessage("Please confirm your new password"),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, message: errors.array()[0].msg });
+    }
+
+    const { newPassword, confirmPassword } = req.body;
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ success: false, message: "Passwords do not match." });
+    }
+
+    try {
+      // Hash the incoming token to compare with what's stored
+      const hashedToken = crypto
+        .createHash("sha256")
+        .update(req.params.token)
+        .digest("hex");
+
+      const user = await User.findOne({
+        resetPasswordToken:   hashedToken,
+        resetPasswordExpires: { $gt: new Date() }, // not expired
+      });
+
+      if (!user) {
+        return res.status(400).json({
+          success: false,
+          message: "This reset link is invalid or has expired. Please request a new one.",
+        });
+      }
+
+      // Set new password — pre-save hook will hash it
+      user.password             = newPassword;
+      user.resetPasswordToken   = null;
+      user.resetPasswordExpires = null;
+      await user.save();
+
+      res.json({
+        success: true,
+        message: "Password reset successfully. You can now log in with your new password.",
+      });
+    } catch (error) {
+      console.error("Reset password error:", error);
+      res.status(500).json({ success: false, message: "Server error. Please try again." });
     }
   }
 );

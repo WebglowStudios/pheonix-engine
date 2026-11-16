@@ -11,6 +11,11 @@ const SiteContent = require("../models/SiteContent");
 const Service = require("../models/Service");
 const Faq = require("../models/Faq");
 const ProductPrice = require("../models/ProductPrice");
+const {
+  calcCurrentValue,
+  calcTaxInfo,
+  consolidateInvestments,
+} = require("../services/portfolioHelpers");
 
 const router = express.Router();
 
@@ -248,80 +253,6 @@ router.get("/users", async (req, res) => {
   }
 });
 
-function calcCurrentValue(inv) {
-  const fixedTypes = ["fd", "ppf", "epf", "nps", "bond"];
-
-  if (fixedTypes.includes(inv.type)) {
-    return typeof inv.estimatedValue === "function"
-      ? inv.estimatedValue()
-      : (inv.principal || inv.investedAmount || 0);
-  }
-
-  if (inv.type === "aif") {
-    return inv.currentPrice > 0 ? inv.currentPrice : (inv.investedAmount || 0);
-  }
-
-  // Market assets with live price
-  if (inv.currentPrice > 0) {
-    if (["stock", "reit_invit", "mutual_fund", "gold", "crypto", "bond"].includes(inv.type)) {
-      return (inv.units || 0) * inv.currentPrice;
-    }
-    if (inv.type === "sip" && inv.avgNav > 0) {
-      const totalUnits = ((inv.sipAmount || 0) * (inv.instalments || 0)) / inv.avgNav;
-      return totalUnits * inv.currentPrice;
-    }
-  }
-
-  return inv.investedAmount || 0;
-}
-
-function calcTaxInfo(inv, currentValue) {
-  const buyDate = inv.buyDate || inv.sipStartDate || inv.createdAt;
-  const today = new Date();
-  const holdingDays = buyDate
-    ? Math.floor((today - new Date(buyDate)) / (1000 * 60 * 60 * 24))
-    : null;
-
-  const gain = currentValue - (inv.investedAmount || 0);
-  const type = inv.type || "";
-
-  let ltcgThresholdDays = 365;
-  let taxRegime = "equity";
-
-  if (["mutual_fund", "sip"].includes(type)) {
-    const cat = (inv.category || "").toLowerCase();
-    taxRegime = cat === "debt" ? "debt" : "equity";
-    ltcgThresholdDays = cat === "debt" ? Infinity : 365;
-  } else if (["stock", "reit_invit"].includes(type)) {
-    taxRegime = "equity"; ltcgThresholdDays = 365;
-  } else if (["fd", "ppf", "epf", "bond", "nps"].includes(type)) {
-    taxRegime = "debt"; ltcgThresholdDays = Infinity;
-  } else if (["gold", "aif"].includes(type)) {
-    taxRegime = "other"; ltcgThresholdDays = 730;
-  } else if (type === "crypto") {
-    taxRegime = "flat30"; ltcgThresholdDays = Infinity;
-  }
-
-  let taxLabel = "STCG", taxRate = null, estimatedTax = 0;
-
-  if (taxRegime === "flat30") {
-    taxLabel = "Flat 30%"; taxRate = 30;
-    estimatedTax = gain > 0 ? Math.round(gain * 0.30) : 0;
-  } else if (taxRegime === "debt") {
-    taxLabel = "Slab Rate"; taxRate = null; estimatedTax = null;
-  } else {
-    const isLTCG = holdingDays !== null && holdingDays >= ltcgThresholdDays;
-    if (isLTCG) {
-      taxLabel = "LTCG"; taxRate = 12.5;
-      estimatedTax = gain > 0 ? Math.round(gain * 0.125) : 0;
-    } else {
-      taxLabel = "STCG"; taxRate = 20;
-      estimatedTax = gain > 0 ? Math.round(gain * 0.20) : 0;
-    }
-  }
-  return { holdingDays, taxLabel, taxRate, estimatedTax };
-}
-
 router.get("/users/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id)
@@ -332,19 +263,18 @@ router.get("/users/:id", async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found." });
     }
 
-    const investments = await Investment.find({ userId: user._id })
+    const rawInvestments = await Investment.find({ userId: user._id })
       .sort({ createdAt: -1 });
+
+    const consolidated = consolidateInvestments(rawInvestments);
 
     let totalInvested = 0;
     let totalCurrent = 0;
     const byType = {};
 
-    const enrichedInvestments = investments.map((inv) => {
-      const cv = calcCurrentValue(inv);
+    consolidated.forEach((inv) => {
       const invested = inv.investedAmount || 0;
-      const gain = cv - invested;
-      const gainPercent = invested > 0 ? (gain / invested) * 100 : 0;
-
+      const cv = inv.currentValue || 0;
       totalInvested += invested;
       totalCurrent += cv;
 
@@ -354,19 +284,6 @@ router.get("/users/:id", async (req, res) => {
       byType[inv.type].count += 1;
       byType[inv.type].invested += invested;
       byType[inv.type].currentValue += cv;
-
-      const tax = calcTaxInfo(inv, cv);
-      const obj = inv.toObject();
-      return {
-        ...obj,
-        currentValue: Math.round(cv * 100) / 100,
-        gain: Math.round(gain * 100) / 100,
-        gainPercent: Math.round(gainPercent * 100) / 100,
-        holdingDays: tax.holdingDays,
-        taxLabel: tax.taxLabel,
-        taxRate: tax.taxRate,
-        estimatedTax: tax.estimatedTax,
-      };
     });
 
     const totalGain = totalCurrent - totalInvested;
@@ -377,9 +294,9 @@ router.get("/users/:id", async (req, res) => {
       currentValue: Math.round(totalCurrent * 100) / 100,
       totalGain: Math.round(totalGain * 100) / 100,
       totalGainPercent: Math.round(totalGainPercent * 100) / 100,
-      holdings: investments.length,
+      holdings: consolidated.length,
       byType,
-      pricesLastUpdated: investments
+      pricesLastUpdated: rawInvestments
         .filter((i) => i.lastPriceUpdate)
         .sort((a, b) => new Date(b.lastPriceUpdate) - new Date(a.lastPriceUpdate))[0]
         ?.lastPriceUpdate ?? null,
@@ -389,9 +306,9 @@ router.get("/users/:id", async (req, res) => {
     res.json({
       success: true,
       user: userObj,
-      investments: enrichedInvestments,
+      investments: consolidated,
       summary,
-      data: { user: userObj, investments: enrichedInvestments, summary },
+      data: { user: userObj, investments: consolidated, summary },
     });
   } catch (error) {
     console.error("Admin get user error:", error);

@@ -4,6 +4,12 @@ const Investment = require("../models/Investment");
 const Transaction = require("../models/Transaction");
 const User = require("../models/User");
 const { protect } = require("../middleware/auth");
+const {
+  calcCurrentValue,
+  calcTaxInfo,
+  getPositionKey,
+  consolidateInvestments,
+} = require("../services/portfolioHelpers");
 
 const router = express.Router();
 
@@ -34,41 +40,12 @@ function calcInvestedAmount(data) {
   }
 }
 
-// -- Helper: compute current value for one investment ---------------------
-function calcCurrentValue(inv) {
-  const fixedTypes = ["fd", "ppf", "epf", "nps"];
-
-  if (fixedTypes.includes(inv.type)) {
-    return inv.estimatedValue();
-  }
-
-  if (inv.type === "aif") {
-    // If current valuation is entered, use it; otherwise fallback to investedAmount
-    return inv.currentPrice > 0 ? inv.currentPrice : (inv.investedAmount || 0);
-  }
-
-  // Market assets with live price
-  if (inv.currentPrice > 0) {
-    if (["stock", "reit_invit", "mutual_fund", "gold", "crypto", "bond"].includes(inv.type)) {
-      return (inv.units || 0) * inv.currentPrice;
-    }
-    if (inv.type === "sip" && inv.avgNav > 0) {
-      // Estimate total units accumulated via SIP
-      const totalUnits = ((inv.sipAmount || 0) * (inv.instalments || 0)) / inv.avgNav;
-      return totalUnits * inv.currentPrice;
-    }
-  }
-
-  // Fallback to invested amount
-  return inv.investedAmount || 0;
-}
-
 // -- GET /api/portfolio/summary --------------------------------------------
 router.get("/summary", async (req, res) => {
   try {
-    const investments = await Investment.find({ userId: req.user._id });
+    const rawInvestments = await Investment.find({ userId: req.user._id });
 
-    if (investments.length === 0) {
+    if (rawInvestments.length === 0) {
       return res.json({
         success: true,
         data: {
@@ -79,51 +56,65 @@ router.get("/summary", async (req, res) => {
       });
     }
 
-    const totalInvested = investments.reduce((s, i) => s + (i.investedAmount || 0), 0);
-    const currentValue = investments.reduce((s, i) => s + calcCurrentValue(i), 0);
+    // Consolidate multi-lot purchases into single unified positions
+    const consolidated = consolidateInvestments(rawInvestments);
+
+    const totalInvested = rawInvestments.reduce((s, i) => s + (i.investedAmount || 0), 0);
+    const currentValue = rawInvestments.reduce((s, i) => s + calcCurrentValue(i), 0);
     const totalGain = currentValue - totalInvested;
     const totalGainPercent = totalInvested > 0 ? (totalGain / totalInvested) * 100 : 0;
 
-    // Allocation by type
+    // Allocation by type (computed across consolidated holdings)
     const byType = {};
-    investments.forEach((inv) => {
+    consolidated.forEach((inv) => {
       if (!byType[inv.type]) byType[inv.type] = { count: 0, invested: 0, currentValue: 0 };
       byType[inv.type].count += 1;
       byType[inv.type].invested += inv.investedAmount || 0;
-      byType[inv.type].currentValue += calcCurrentValue(inv);
+      byType[inv.type].currentValue += inv.currentValue || 0;
     });
 
     // Latest price update timestamp
-    const pricesLastUpdated = investments
+    const pricesLastUpdated = rawInvestments
       .filter((i) => i.lastPriceUpdate)
       .sort((a, b) => new Date(b.lastPriceUpdate) - new Date(a.lastPriceUpdate))[0]
       ?.lastPriceUpdate ?? null;
 
-    // Recent investments (last 6)
-    const recentInvestments = [...investments]
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    // Recent investments (consolidated, top 6 sorted by most recent purchase/transaction date)
+    const recentInvestments = [...consolidated]
+      .sort((a, b) => {
+        const dateA = new Date(a.latestBuyDate || a.createdAt || 0).getTime();
+        const dateB = new Date(b.latestBuyDate || b.createdAt || 0).getTime();
+        return dateB - dateA;
+      })
       .slice(0, 6)
-      .map((inv) => {
-        const cv = calcCurrentValue(inv);
-        return {
-          _id: inv._id, name: inv.name, type: inv.type,
-          investedAmount: inv.investedAmount,
-          currentValue: cv,
-          gain: cv - inv.investedAmount,
-          gainPercent: inv.investedAmount > 0 ? ((cv - inv.investedAmount) / inv.investedAmount) * 100 : 0,
-          symbol: inv.symbol,
-          buyDate: inv.buyDate || inv.sipStartDate,
-          createdAt: inv.createdAt,
-          notes: inv.notes || "",
-        };
-      });
+      .map((inv) => ({
+        _id: inv._id,
+        name: inv.name,
+        type: inv.type,
+        investedAmount: inv.investedAmount,
+        currentValue: inv.currentValue,
+        gain: inv.gain,
+        gainPercent: inv.gainPercent,
+        symbol: inv.symbol,
+        buyDate: inv.latestBuyDate || inv.buyDate || inv.firstBuyDate,
+        firstBuyDate: inv.firstBuyDate,
+        latestBuyDate: inv.latestBuyDate,
+        lotCount: inv.lotCount || 1,
+        createdAt: inv.createdAt,
+        notes: inv.notes || "",
+      }));
 
     res.json({
       success: true,
       data: {
-        totalInvested, currentValue, totalGain,
-        totalGainPercent, holdings: investments.length,
-        byType, recentInvestments, pricesLastUpdated,
+        totalInvested: Math.round(totalInvested * 100) / 100,
+        currentValue: Math.round(currentValue * 100) / 100,
+        totalGain: Math.round(totalGain * 100) / 100,
+        totalGainPercent: Math.round(totalGainPercent * 100) / 100,
+        holdings: consolidated.length,
+        byType,
+        recentInvestments,
+        pricesLastUpdated,
       },
     });
   } catch (err) {
@@ -132,88 +123,10 @@ router.get("/summary", async (req, res) => {
   }
 });
 
-// ── Tax classification helper ──────────────────────────────────────────────
-// Indian FY2024-25 rules (post-Budget 2024):
-//   Equity / Equity MF / REIT-InvIT : LTCG if > 12 months  → 12.5% (above ₹1.25L exempt)
-//   Debt MF / Bond / FD / PPF / EPF  : always at slab rate (no indexation)
-//   Gold / AIF / NPS / Other         : LTCG if > 24 months  → 12.5%
-//   Crypto                            : flat 30% regardless of holding period
-function calcTaxInfo(inv, currentValue) {
-  const buyDate  = inv.buyDate || inv.sipStartDate || inv.createdAt;
-  const today    = new Date();
-  const holdingDays = buyDate
-    ? Math.floor((today - new Date(buyDate)) / (1000 * 60 * 60 * 24))
-    : null;
-
-  const gain     = currentValue - (inv.investedAmount || 0);
-  const type     = inv.type || "";
-
-  // Determine LTCG threshold in days per asset class
-  let ltcgThresholdDays = 365; // default: equity
-  let taxRegime = "equity";    // equity | debt | flat30
-
-  if (["mutual_fund", "sip"].includes(type)) {
-    const cat = (inv.category || "").toLowerCase();
-    if (cat === "debt") {
-      taxRegime = "debt";
-      ltcgThresholdDays = Infinity; // always slab
-    } else {
-      taxRegime = "equity"; // equity MF
-      ltcgThresholdDays = 365;
-    }
-  } else if (["stock", "reit_invit"].includes(type)) {
-    taxRegime = "equity";
-    ltcgThresholdDays = 365;
-  } else if (["fd", "ppf", "epf", "bond", "nps"].includes(type)) {
-    taxRegime = "debt";
-    ltcgThresholdDays = Infinity;
-  } else if (["gold", "aif"].includes(type)) {
-    taxRegime = "other";
-    ltcgThresholdDays = 730; // 2 years (changed from 3yr post-Budget 2024)
-  } else if (type === "crypto") {
-    taxRegime = "flat30";
-    ltcgThresholdDays = Infinity;
-  }
-
-  let taxLabel   = "STCG";
-  let taxRate    = null;
-  let estimatedTax = 0;
-
-  if (taxRegime === "flat30") {
-    taxLabel = "Flat 30%";
-    taxRate  = 30;
-    estimatedTax = gain > 0 ? Math.round(gain * 0.30) : 0;
-  } else if (taxRegime === "debt") {
-    taxLabel = "Slab Rate";
-    taxRate  = null; // depends on user's income slab
-    estimatedTax = null; // can't compute without slab
-  } else {
-    // equity / other
-    const isLTCG = holdingDays !== null && holdingDays >= ltcgThresholdDays;
-    if (isLTCG) {
-      taxLabel = "LTCG";
-      taxRate  = 12.5;
-      // Equity LTCG: ₹1.25L exempt per year (we show gross tax here)
-      estimatedTax = gain > 0 ? Math.round(gain * 0.125) : 0;
-    } else {
-      taxLabel = "STCG";
-      taxRate  = 20; // post-Budget 2024 (was 15%)
-      estimatedTax = gain > 0 ? Math.round(gain * 0.20) : 0;
-    }
-  }
-
-  return {
-    holdingDays,
-    taxLabel,     // "STCG" | "LTCG" | "Slab Rate" | "Flat 30%"
-    taxRate,      // number or null
-    estimatedTax, // ₹ or null
-  };
-}
-
 // -- GET /api/portfolio ----------------------------------------------------
 router.get("/", async (req, res) => {
   try {
-    const { type, sort = "createdAt", order = "desc", search } = req.query;
+    const { type, sort = "createdAt", order = "desc", search, raw } = req.query;
     const filter = { userId: req.user._id };
     if (type && type !== "all") {
       if (type === "ppf_epf") {
@@ -233,26 +146,41 @@ router.get("/", async (req, res) => {
     const sortDir = order === "asc" ? 1 : -1;
     const investments = await Investment.find(filter).sort({ [sort]: sortDir });
 
-    // Attach computed fields to each investment
-    const result = investments.map((inv) => {
-      const obj = inv.toObject();
-      const cv  = calcCurrentValue(inv);
-      obj.currentValue  = cv;
-      obj.gain          = cv - (inv.investedAmount || 0);
-      obj.gainPercent   = (inv.investedAmount || 0) > 0
-        ? (obj.gain / inv.investedAmount) * 100 : 0;
+    // Raw mode: returns unconsolidated individual lot documents
+    if (raw === "true") {
+      const result = investments.map((inv) => {
+        const obj = inv.toObject();
+        const cv  = calcCurrentValue(inv);
+        obj.currentValue  = cv;
+        obj.gain          = cv - (inv.investedAmount || 0);
+        obj.gainPercent   = (inv.investedAmount || 0) > 0
+          ? (obj.gain / inv.investedAmount) * 100 : 0;
+        const tax = calcTaxInfo(inv, cv);
+        obj.holdingDays   = tax.holdingDays;
+        obj.taxLabel      = tax.taxLabel;
+        obj.taxRate       = tax.taxRate;
+        obj.estimatedTax  = tax.estimatedTax;
+        return obj;
+      });
+      return res.json({ success: true, data: result, count: result.length });
+    }
 
-      // ── Tax & holding period fields ──────────────────────────────
-      const tax = calcTaxInfo(inv, cv);
-      obj.holdingDays   = tax.holdingDays;
-      obj.taxLabel      = tax.taxLabel;
-      obj.taxRate       = tax.taxRate;
-      obj.estimatedTax  = tax.estimatedTax;
+    // Default mode: returns consolidated positions with underlying lots
+    const consolidated = consolidateInvestments(investments);
 
-      return obj;
+    // Apply sort on consolidated array
+    consolidated.sort((a, b) => {
+      let valA = a[sort];
+      let valB = b[sort];
+      if (valA === undefined) valA = 0;
+      if (valB === undefined) valB = 0;
+      if (typeof valA === "string") {
+        return sortDir === 1 ? valA.localeCompare(valB) : valB.localeCompare(valA);
+      }
+      return sortDir === 1 ? valA - valB : valB - valA;
     });
 
-    res.json({ success: true, data: result, count: result.length });
+    res.json({ success: true, data: consolidated, count: consolidated.length });
   } catch (err) {
     console.error("Get portfolio error:", err);
     res.status(500).json({ success: false, message: "Server error." });
@@ -704,47 +632,39 @@ router.post(
       const sellDate    = req.body.sellDate ? new Date(req.body.sellDate) : new Date();
       const notes       = (req.body.notes || "").trim();
 
-      const availableUnits = investment.units || 0;
-      if (unitsToSell > availableUnits) {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot sell ${unitsToSell} units. Only ${availableUnits} units available in this lot.`,
-        });
+      // ───────────────────────────────────────────────────────────
+      // STEP 1: Find ALL active lots for this position (matching symbol or name+type)
+      // to compute the position-level weighted average cost and check total available units.
+      // ───────────────────────────────────────────────────────────
+      const targetKey = getPositionKey(investment);
+      const userActiveInvestments = await Investment.find({
+        userId: req.user._id,
+        status: "active",
+        type: investment.type,
+      });
+
+      let allLots = userActiveInvestments.filter((inv) => getPositionKey(inv) === targetKey);
+      if (allLots.length === 0) {
+        allLots = [investment];
       }
 
-      // ───────────────────────────────────────────────────────────
-      // STEP 1: Find ALL active lots for this symbol+exchange to compute
-      // the position-level weighted average cost.
-      // If the investment has no symbol (FD, PPF, etc.) fall back to single-lot buyPrice.
-      // ───────────────────────────────────────────────────────────
-      let avgCost = investment.buyPrice || (availableUnits > 0 ? investment.investedAmount / availableUnits : 0);
-      let totalOpenQtyBefore = availableUnits; // default: only this lot
+      let totalUnits    = 0;
+      let totalCostBasis = 0;
+      allLots.forEach((lot) => {
+        const lotUnits = lot.units || 0;
+        const lotBuy   = lot.buyPrice || (lot.investedAmount > 0 && lotUnits > 0 ? lot.investedAmount / lotUnits : 0);
+        totalUnits    += lotUnits;
+        totalCostBasis += lotUnits * lotBuy;
+      });
 
-      if (investment.symbol) {
-        // Fetch all active lots for the same symbol+exchange
-        const positionFilter = {
-          userId:   req.user._id,
-          symbol:   investment.symbol,
-          status:   "active",
-          units:    { $gt: 0 },
-        };
-        if (investment.exchange) positionFilter.exchange = investment.exchange;
+      const totalOpenQtyBefore = totalUnits > 0 ? totalUnits : (investment.units || 0);
+      const avgCost            = totalUnits > 0 ? totalCostBasis / totalUnits : (investment.buyPrice || 0);
 
-        const allLots = await Investment.find(positionFilter);
-
-        if (allLots.length > 0) {
-          // Weighted avg: sum(units_i * buyPrice_i) / sum(units_i)
-          let totalUnits    = 0;
-          let totalCostBasis = 0;
-          allLots.forEach((lot) => {
-            const lotUnits = lot.units || 0;
-            const lotBuy   = lot.buyPrice || (lot.investedAmount > 0 && lotUnits > 0 ? lot.investedAmount / lotUnits : 0);
-            totalUnits    += lotUnits;
-            totalCostBasis += lotUnits * lotBuy;
-          });
-          avgCost             = totalUnits > 0 ? totalCostBasis / totalUnits : avgCost;
-          totalOpenQtyBefore  = totalUnits;
-        }
+      if (unitsToSell > totalOpenQtyBefore) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot sell ${unitsToSell} units. Only ${totalOpenQtyBefore} units available across active lots.`,
+        });
       }
 
       // ───────────────────────────────────────────────────────────
@@ -758,20 +678,15 @@ router.post(
 
       // Open qty after this sell (across ALL lots)
       const openQtyAfter   = Math.round((totalOpenQtyBefore - unitsToSell) * 1000) / 1000;
-      // Avg cost of remaining open position is unchanged by a sell
       const avgCostAfter   = openQtyAfter > 0 ? avgCost : 0;
 
-      // Free Shares tracking (capital recovery against this specific lot)
+      // Free Shares tracking (capital recovery against this position)
       if (!investment.originalInvestedAmount || investment.originalInvestedAmount === 0) {
         investment.originalInvestedAmount = investment.investedAmount || 0;
       }
       const cumulativeProceeds = (investment.totalProceeds || 0) + totalProceeds;
       const originalCapital    = investment.originalInvestedAmount || investment.investedAmount;
       const isFreeShares       = cumulativeProceeds >= originalCapital && originalCapital > 0;
-
-      // Remaining units on THIS specific lot document
-      const remainingUnits   = Math.round((availableUnits - unitsToSell) * 1000) / 1000;
-      const remainingValue   = Math.round(remainingUnits * sellPrice * 100) / 100;
 
       // ───────────────────────────────────────────────────────────
       // STEP 3: Persist transaction record with full position context
@@ -785,34 +700,51 @@ router.post(
         type:                "sell",
         units:               unitsToSell,
         price:               sellPrice,
-        buyPrice:            investment.buyPrice || 0,   // original lot buy price (for reference)
-        avgCostBefore:       Math.round(avgCost * 100) / 100,  // ← position avg cost
+        buyPrice:            investment.buyPrice || 0,
+        avgCostBefore:       Math.round(avgCost * 100) / 100,
         totalProceeds,
         realizedGain,
         realizedGainPercent,
         capitalRecovered:    Math.min(cumulativeProceeds, originalCapital),
         isFreeShares,
-        openQtyAfter,        // ← total open qty across all lots after this sell
+        openQtyAfter,
         avgCostAfter:        Math.round(avgCostAfter * 100) / 100,
-        remainingUnits,      // legacy: units left in this specific lot
-        remainingValue,
+        remainingUnits:      openQtyAfter,
+        remainingValue:      Math.round(openQtyAfter * sellPrice * 100) / 100,
         sellDate,
         notes,
       });
 
       // ───────────────────────────────────────────────────────────
-      // STEP 4: Update the sold lot document
+      // STEP 4: Deduct sold units in FIFO order across matching lots (oldest first)
       // ───────────────────────────────────────────────────────────
-      investment.totalProceeds  = cumulativeProceeds;
-      investment.realizedGain   = (investment.realizedGain || 0) + realizedGain;
-      investment.units          = remainingUnits;
-      investment.investedAmount = Math.round(remainingUnits * avgCost * 100) / 100; // use avg cost
-      investment.isFreeShare    = isFreeShares && remainingUnits > 0;
+      let remainingToDeduct = unitsToSell;
+      allLots.sort((a, b) => {
+        const dateA = new Date(a.buyDate || a.sipStartDate || a.createdAt || 0).getTime();
+        const dateB = new Date(b.buyDate || b.sipStartDate || b.createdAt || 0).getTime();
+        return dateA - dateB;
+      });
 
-      if (remainingUnits === 0) {
-        investment.status = "closed";
+      for (const lot of allLots) {
+        if (remainingToDeduct <= 0) break;
+        const lotUnits = lot.units || 0;
+        if (lotUnits <= 0) continue;
+
+        const deduct = Math.min(lotUnits, remainingToDeduct);
+        const lotRemaining = Math.round((lotUnits - deduct) * 1000) / 1000;
+        lot.units = lotRemaining;
+        lot.investedAmount = Math.round(lotRemaining * (lot.buyPrice || avgCost) * 100) / 100;
+        if (lotRemaining === 0) {
+          lot.status = "closed";
+        }
+        remainingToDeduct -= deduct;
+        await lot.save();
       }
 
+      // Update primary investment object properties
+      investment.totalProceeds  = cumulativeProceeds;
+      investment.realizedGain   = (investment.realizedGain || 0) + realizedGain;
+      investment.isFreeShare    = isFreeShares && openQtyAfter > 0;
       await investment.save();
 
       const obj = investment.toObject();
